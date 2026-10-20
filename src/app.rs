@@ -1,5 +1,5 @@
 use std::{
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -10,9 +10,9 @@ use eframe::egui::{
 };
 
 use crate::{
-    config::Config,
+    config::{Config, Metric},
     format::{self, Level},
-    sampler::{self, HISTORY_LEN, History, Shared},
+    sampler::{self, HISTORY_LEN, History, Settings, Shared},
 };
 
 pub const STRIP_HEIGHT: f32 = 24.0;
@@ -27,18 +27,11 @@ const LABEL_COLOR: Color32 = Color32::from_gray(150);
 const TEXT_COLOR: Color32 = Color32::from_gray(230);
 const WARN_COLOR: Color32 = Color32::from_rgb(255, 190, 70);
 const HOT_COLOR: Color32 = Color32::from_rgb(255, 95, 85);
-/// Wait for the window to stop moving before writing the config to disk.
+/// Wait for the window to stop moving (or a slider to settle) before writing the config to disk.
 const SAVE_DELAY: Duration = Duration::from_millis(800);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Metric {
-    Cpu,
-    Memory,
-    Gpu,
-    Vram,
-    Network,
-    Disk,
-}
+/// Used to place the menu before its real size is known; it then resizes itself to fit.
+const MENU_SIZE: Vec2 = Vec2::new(230.0, 330.0);
+const REFRESH_CHOICES: [(u64, &str); 3] = [(500, "0.5 s"), (1000, "1 s"), (2000, "2 s")];
 
 pub struct App {
     config: Config,
@@ -58,7 +51,7 @@ struct MenuState {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let shared = sampler::spawn(cc.egui_ctx.clone(), Duration::from_millis(config.refresh_ms));
+        let shared = sampler::spawn(cc.egui_ctx.clone(), Settings::from_config(&config));
         Self { saved: config.clone(), config, dirty_since: None, shared, menu: None }
     }
 
@@ -70,19 +63,22 @@ impl App {
         self.dirty_since = None;
     }
 
-    /// Records the window position and saves once it has been stable for `SAVE_DELAY`.
-    fn persist_position(&mut self, ctx: &egui::Context) {
+    /// Records the window position and saves any config change once it has been stable for `SAVE_DELAY`.
+    fn persist(&mut self, ctx: &egui::Context) {
         let position = ctx.input(|i| i.viewport().outer_rect).map(|r| [r.min.x.round(), r.min.y.round()]);
         if position.is_some() && position != self.config.position {
             self.config.position = position;
-            self.dirty_since = Some(Instant::now());
+            self.dirty_since = Some(Instant::now()); // restart the wait while the strip keeps moving
         }
-        if let Some(since) = self.dirty_since {
-            if since.elapsed() >= SAVE_DELAY {
-                self.save_now();
-            } else {
-                ctx.request_repaint_after(SAVE_DELAY - since.elapsed());
-            }
+        if self.config == self.saved {
+            self.dirty_since = None;
+            return;
+        }
+        let since = *self.dirty_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= SAVE_DELAY {
+            self.save_now();
+        } else {
+            ctx.request_repaint_after(SAVE_DELAY - since.elapsed());
         }
     }
 
@@ -99,7 +95,8 @@ impl App {
         let mut close = false;
         let mut exit = false;
 
-        let builder = popup_builder("Compteur menu", menu.position, Vec2::new(160.0, 40.0));
+        let config = &mut self.config;
+        let builder = popup_builder("Compteur menu", menu.position, MENU_SIZE);
         ctx.show_viewport_immediate(ViewportId::from_hash_of("menu"), builder, |ui, _class| {
             let focused = ui.ctx().input(|i| i.viewport().focused);
             menu.was_focused |= focused == Some(true);
@@ -108,11 +105,16 @@ impl App {
             {
                 close = true;
             }
-            egui::CentralPanel::default().show(ui, |ui| {
-                if ui.button("Exit Compteur").clicked() {
-                    exit = true;
-                }
+            let panel = egui::CentralPanel::default().show(ui, |ui| {
+                exit = menu_contents(ui, config);
+                ui.min_rect().size()
             });
+            // Fit the window to its contents plus the panel's 8 pt margin on each side.
+            let wanted = (panel.inner + Vec2::splat(16.0)).ceil();
+            let current = ui.ctx().input(|i| i.viewport().inner_rect).map(|r| r.size());
+            if current.is_some_and(|current| (current - wanted).length() > 1.0) {
+                ui.ctx().send_viewport_cmd(ViewportCommand::InnerSize(wanted));
+            }
         });
 
         if exit {
@@ -132,11 +134,15 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.persist_position(&ctx);
+        self.persist(&ctx);
 
-        let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
-        let segments: Vec<(Metric, Arc<Galley>)> =
-            segments(&shared).into_iter().map(|(metric, job)| (metric, ui.painter().layout_job(job))).collect();
+        let mut shared = sampler::lock(&self.shared);
+        shared.settings = Settings::from_config(&self.config);
+        let segments: Vec<(Metric, Arc<Galley>)> = segments(&shared)
+            .into_iter()
+            .filter(|(metric, _)| self.config.shown.get(*metric))
+            .map(|(metric, job)| (metric, ui.painter().layout_job(job)))
+            .collect();
         let separator = ui.painter().layout_no_wrap(SEPARATOR.to_owned(), FontId::monospace(FONT_SIZE), LABEL_COLOR);
 
         let content_width = segments.iter().map(|(_, galley)| galley.size().x).sum::<f32>()
@@ -164,13 +170,15 @@ impl eframe::App for App {
         }
 
         let response = ui.interact(rect, Id::unique("strip"), Sense::click_and_drag());
-        if response.drag_started_by(PointerButton::Primary) {
+        if response.drag_started_by(PointerButton::Primary) && !self.config.locked {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
         let strip_origin = ctx.input(|i| i.viewport().outer_rect).map_or(Pos2::ZERO, |r| r.min);
+        let monitor_height = ctx.input(|i| i.viewport().monitor_size).map(|s| s.y);
         if response.secondary_clicked() {
-            let click = response.interact_pointer_pos().unwrap_or(rect.left_bottom());
-            self.menu = Some(MenuState { position: strip_origin + click.to_vec2(), was_focused: false });
+            let click_x = response.interact_pointer_pos().map_or(0.0, |p| p.x);
+            let y = popup_y(strip_origin.y, MENU_SIZE.y, monitor_height);
+            self.menu = Some(MenuState { position: Pos2::new(strip_origin.x + click_x, y), was_focused: false });
         }
 
         // Details for the hovered segment, unless the menu or a drag is in progress.
@@ -187,11 +195,40 @@ impl eframe::App for App {
                 .into_iter()
                 .map(|line| ui.painter().layout_no_wrap(line, FontId::monospace(DETAIL_FONT_SIZE), TEXT_COLOR))
                 .collect();
-            let monitor_height = ctx.input(|i| i.viewport().monitor_size).map(|s| s.y);
             show_details(&ctx, strip_origin, x - PADDING_X, monitor_height, galleys);
         }
         self.show_menu(&ctx);
     }
+}
+
+/// Settings menu. Changes apply immediately; returns true when Exit was clicked.
+fn menu_contents(ui: &mut egui::Ui, config: &mut Config) -> bool {
+    ui.label(egui::RichText::new("Show on strip").strong());
+    let shown_count = config.shown.count();
+    for metric in Metric::ALL {
+        let mut on = config.shown.get(metric);
+        // Keep at least one metric, or the strip would vanish along with its menu.
+        let is_last = on && shown_count == 1;
+        if ui.add_enabled(!is_last, egui::Checkbox::new(&mut on, metric.label())).changed() {
+            config.shown.set(metric, on);
+        }
+    }
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Refresh");
+        for (ms, label) in REFRESH_CHOICES {
+            ui.selectable_value(&mut config.refresh_ms, ms, label);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Opacity");
+        ui.add(egui::Slider::new(&mut config.opacity, 0.2..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+    });
+    ui.checkbox(&mut config.locked, "Lock position");
+
+    ui.separator();
+    ui.button("Exit Compteur").clicked()
 }
 
 fn level_color(level: Level) -> Color32 {
@@ -368,15 +405,19 @@ fn popup_builder(title: &str, position: Pos2, size: Vec2) -> ViewportBuilder {
         .with_taskbar(false)
 }
 
+/// Top of a popup `height` tall: below the strip, or above it when it would run off the screen.
+fn popup_y(strip_top: f32, height: f32, monitor_height: Option<f32>) -> f32 {
+    let below = strip_top + STRIP_HEIGHT + POPUP_GAP;
+    if monitor_height.is_none_or(|h| below + height <= h) { below } else { strip_top - POPUP_GAP - height }
+}
+
 /// Shows `lines` below the strip (or above it, near the bottom of the screen), aligned to `x`.
 fn show_details(ctx: &egui::Context, strip_origin: Pos2, x: f32, monitor_height: Option<f32>, lines: Vec<Arc<Galley>>) {
     let width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max);
     let height: f32 = lines.iter().map(|g| g.size().y).sum();
     let size = Vec2::new(width, height) + Vec2::splat(2.0 * DETAIL_PADDING);
 
-    let below = strip_origin.y + STRIP_HEIGHT + POPUP_GAP;
-    let fits_below = monitor_height.is_none_or(|h| below + size.y <= h);
-    let y = if fits_below { below } else { strip_origin.y - POPUP_GAP - size.y };
+    let y = popup_y(strip_origin.y, size.y, monitor_height);
     let builder = popup_builder("Compteur details", Pos2::new(strip_origin.x + x, y), size.ceil())
         .with_active(false)
         .with_mouse_passthrough(true);

@@ -10,6 +10,7 @@ use std::{
 use eframe::egui;
 use sysinfo::System;
 
+use crate::config::{Config, Shown};
 use crate::metrics::{
     Snapshot, cpu_mem,
     disk_net::{DiskSampler, NetSampler},
@@ -43,17 +44,33 @@ impl History {
     }
 }
 
+/// What the sampler should do; written by the UI, read by the sampler at every tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settings {
+    pub interval: Duration,
+    pub shown: Shown,
+}
+
+impl Settings {
+    pub fn from_config(config: &Config) -> Self {
+        let interval = Duration::from_millis(config.refresh_ms).max(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        Self { interval, shown: config.shown }
+    }
+}
+
 /// State shared between the sampler thread and the UI.
 pub struct Shared {
+    pub settings: Settings,
     pub snapshot: Snapshot,
     pub cpu_history: History,
     pub memory_history: History,
     pub gpu_history: History,
 }
 
-impl Default for Shared {
-    fn default() -> Self {
+impl Shared {
+    fn new(settings: Settings) -> Self {
         Self {
+            settings,
             snapshot: Snapshot::default(),
             cpu_history: History::new(HISTORY_LEN),
             memory_history: History::new(HISTORY_LEN),
@@ -63,9 +80,8 @@ impl Default for Shared {
 }
 
 /// Starts the sampler. The thread lives for the whole process, so it is never joined.
-pub fn spawn(ctx: egui::Context, interval: Duration) -> Arc<Mutex<Shared>> {
-    let shared = Arc::new(Mutex::new(Shared::default()));
-    let interval = interval.max(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+pub fn spawn(ctx: egui::Context, settings: Settings) -> Arc<Mutex<Shared>> {
+    let shared = Arc::new(Mutex::new(Shared::new(settings)));
     let thread_shared = Arc::clone(&shared);
 
     thread::Builder::new()
@@ -78,22 +94,28 @@ pub fn spawn(ctx: egui::Context, interval: Duration) -> Arc<Mutex<Shared>> {
             let mut net_sampler = NetSampler::new();
             let mut gpu_sampler = GpuSampler::new();
             loop {
+                let Settings { interval, shown } = lock(&thread_shared).settings;
                 thread::sleep(interval);
-                let cpu = cpu_mem::sample_cpu(&mut sys);
-                let memory = cpu_mem::sample_memory(&mut sys);
-                let disk = disk_sampler.sample();
-                let network = net_sampler.sample();
-                let gpu = gpu_sampler.sample();
 
+                // Hidden metrics aren't sampled at all; GPU counters in particular cost CPU time.
                 // Sample outside the lock, so the UI never waits on a slow system call.
-                let mut shared = thread_shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                shared.cpu_history.push(cpu.usage);
-                shared.memory_history.push(memory.percent());
+                let cpu = shown.cpu.then(|| cpu_mem::sample_cpu(&mut sys));
+                let memory = shown.memory.then(|| cpu_mem::sample_memory(&mut sys));
+                let gpu = (shown.gpu || shown.vram).then(|| gpu_sampler.sample()).flatten();
+                let network = shown.network.then(|| net_sampler.sample());
+                let disk = shown.disk.then(|| disk_sampler.sample());
+
+                let mut shared = lock(&thread_shared);
+                if let Some(cpu) = &cpu {
+                    shared.cpu_history.push(cpu.usage);
+                }
+                if let Some(memory) = &memory {
+                    shared.memory_history.push(memory.percent());
+                }
                 if let Some(usage) = gpu.as_ref().and_then(|g| g.usage()) {
                     shared.gpu_history.push(usage);
                 }
-                shared.snapshot =
-                    Snapshot { cpu: Some(cpu), memory: Some(memory), gpu, disk: Some(disk), network: Some(network) };
+                shared.snapshot = Snapshot { cpu, memory, gpu, disk, network };
                 drop(shared);
                 ctx.request_repaint();
             }
@@ -101,6 +123,11 @@ pub fn spawn(ctx: egui::Context, interval: Duration) -> Arc<Mutex<Shared>> {
         .expect("failed to spawn sampler thread");
 
     shared
+}
+
+/// Locks the shared state, recovering it if a panicking thread poisoned the lock.
+pub fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

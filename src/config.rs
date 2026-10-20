@@ -2,6 +2,76 @@ use std::{fs, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// A metric that can be shown on the strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    Cpu,
+    Memory,
+    Gpu,
+    Vram,
+    Network,
+    Disk,
+}
+
+impl Metric {
+    /// Strip order.
+    pub const ALL: [Self; 6] = [Self::Cpu, Self::Memory, Self::Gpu, Self::Vram, Self::Network, Self::Disk];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU load",
+            Self::Memory => "RAM usage",
+            Self::Gpu => "GPU load",
+            Self::Vram => "GPU memory (VRAM)",
+            Self::Network => "Network speed",
+            Self::Disk => "Disk activity",
+        }
+    }
+}
+
+/// Which metrics are on the strip. A struct rather than a list so the TOML reads `cpu = true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Shown {
+    pub cpu: bool,
+    pub memory: bool,
+    pub gpu: bool,
+    pub vram: bool,
+    pub network: bool,
+    pub disk: bool,
+}
+
+impl Default for Shown {
+    fn default() -> Self {
+        Self { cpu: true, memory: true, gpu: true, vram: true, network: true, disk: true }
+    }
+}
+
+impl Shown {
+    fn flag(&mut self, metric: Metric) -> &mut bool {
+        match metric {
+            Metric::Cpu => &mut self.cpu,
+            Metric::Memory => &mut self.memory,
+            Metric::Gpu => &mut self.gpu,
+            Metric::Vram => &mut self.vram,
+            Metric::Network => &mut self.network,
+            Metric::Disk => &mut self.disk,
+        }
+    }
+
+    pub fn get(mut self, metric: Metric) -> bool {
+        *self.flag(metric)
+    }
+
+    pub fn set(&mut self, metric: Metric, on: bool) {
+        *self.flag(metric) = on;
+    }
+
+    pub fn count(self) -> usize {
+        Metric::ALL.iter().filter(|m| self.get(**m)).count()
+    }
+}
+
 /// User settings, persisted as TOML in `%APPDATA%\compteur\config\config.toml`.
 ///
 /// `#[serde(default)]` lets older or hand-edited files load: missing keys fall back to defaults.
@@ -14,11 +84,14 @@ pub struct Config {
     pub opacity: f32,
     /// How often metrics are sampled, in milliseconds.
     pub refresh_ms: u64,
+    /// When set, the strip can't be dragged.
+    pub locked: bool,
+    pub shown: Shown,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { position: None, opacity: 0.85, refresh_ms: 1000 }
+        Self { position: None, opacity: 0.85, refresh_ms: 1000, locked: false, shown: Shown::default() }
     }
 }
 
@@ -39,6 +112,9 @@ impl Config {
         let mut config: Self = toml::from_str(text).unwrap_or_default();
         config.opacity = config.opacity.clamp(0.2, 1.0);
         config.refresh_ms = config.refresh_ms.clamp(250, 5000);
+        if config.shown.count() == 0 {
+            config.shown = Shown::default(); // an empty strip would be invisible and unclickable
+        }
         config
     }
 
@@ -61,7 +137,8 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml() {
-        let config = Config { position: Some([12.0, 34.0]), opacity: 0.5, refresh_ms: 500 };
+        let mut config = Config { position: Some([12.0, 34.0]), opacity: 0.5, refresh_ms: 500, locked: true, ..Config::default() };
+        config.shown.set(Metric::Gpu, false);
         let text = toml::to_string_pretty(&config).unwrap();
         assert_eq!(Config::from_toml(&text), config);
     }
@@ -76,6 +153,18 @@ mod tests {
         let config = Config::from_toml("opacity = 0.6");
         assert_eq!(config.position, None);
         assert_eq!(config.opacity, 0.6);
+    }
+
+    #[test]
+    fn all_metrics_hidden_resets_to_all_shown() {
+        let text = "[shown]
+cpu = false
+memory = false
+gpu = false
+vram = false
+network = false
+disk = false";
+        assert_eq!(Config::from_toml(text).shown, Shown::default());
     }
 
     #[test]
