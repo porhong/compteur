@@ -12,11 +12,13 @@ pub struct Config {
     pub position: Option<[f32; 2]>,
     /// Background opacity, 0.0–1.0.
     pub opacity: f32,
+    /// How often metrics are sampled, in milliseconds.
+    pub refresh_ms: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { position: None, opacity: 0.85 }
+        Self { position: None, opacity: 0.85, refresh_ms: 1000 }
     }
 }
 
@@ -36,6 +38,7 @@ impl Config {
     fn from_toml(text: &str) -> Self {
         let mut config: Self = toml::from_str(text).unwrap_or_default();
         config.opacity = config.opacity.clamp(0.2, 1.0);
+        config.refresh_ms = config.refresh_ms.clamp(250, 5000);
         config
     }
 
@@ -58,7 +61,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml() {
-        let config = Config { position: Some([12.0, 34.0]), opacity: 0.5 };
+        let config = Config { position: Some([12.0, 34.0]), opacity: 0.5, refresh_ms: 500 };
         let text = toml::to_string_pretty(&config).unwrap();
         assert_eq!(Config::from_toml(&text), config);
     }
@@ -76,7 +79,9 @@ mod tests {
     }
 
     #[test]
-    fn opacity_is_clamped() {
-        assert_eq!(Config::from_toml("opacity = 7.0").opacity, 1.0);
+    fn out_of_range_values_are_clamped() {
+        let config = Config::from_toml("opacity = 7.0\nrefresh_ms = 1");
+        assert_eq!(config.opacity, 1.0);
+        assert_eq!(config.refresh_ms, 250);
     }
 }

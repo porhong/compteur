@@ -3,6 +3,9 @@
 
 mod app;
 mod config;
+mod format;
+mod metrics;
+mod sampler;
 
 use eframe::egui;
 
