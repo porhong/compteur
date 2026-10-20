@@ -34,6 +34,8 @@ const SAVE_DELAY: Duration = Duration::from_millis(800);
 enum Metric {
     Cpu,
     Memory,
+    Network,
+    Disk,
 }
 
 pub struct App {
@@ -198,21 +200,51 @@ fn level_color(level: Level) -> Color32 {
     }
 }
 
-/// One `LABEL value` segment: dim label, value colored by how alarming it is.
-fn segment_job(label: &str, percent: Option<f32>) -> LayoutJob {
+/// One strip segment built from differently colored text runs.
+fn segment_job(parts: &[(&str, Color32)]) -> LayoutJob {
     let font = FontId::monospace(FONT_SIZE);
-    let level = percent.map_or(Level::Normal, Level::for_percent);
     let mut job = LayoutJob::default();
-    job.append(label, 0.0, TextFormat::simple(font.clone(), LABEL_COLOR));
-    job.append(&format::percent(percent), 0.0, TextFormat::simple(font, level_color(level)));
+    for (text, color) in parts {
+        job.append(text, 0.0, TextFormat::simple(font.clone(), *color));
+    }
     job
+}
+
+fn percent_color(percent: Option<f32>) -> Color32 {
+    level_color(percent.map_or(Level::Normal, Level::for_percent))
+}
+
+fn percent_segment(label: &str, percent: Option<f32>) -> LayoutJob {
+    segment_job(&[(label, LABEL_COLOR), (&format::percent(percent), percent_color(percent))])
 }
 
 fn segments(shared: &Shared) -> Vec<(Metric, LayoutJob)> {
     let snapshot = &shared.snapshot;
+    let network = snapshot.network.as_ref();
+    let disk = snapshot.disk.as_ref();
+    // Disk rates are colored by how busy the disks are, not by throughput.
+    let disk_color = percent_color(disk.and_then(|d| d.active_percent));
     vec![
-        (Metric::Cpu, segment_job("CPU ", snapshot.cpu.as_ref().map(|cpu| cpu.usage))),
-        (Metric::Memory, segment_job("RAM ", snapshot.memory.as_ref().map(|memory| memory.percent()))),
+        (Metric::Cpu, percent_segment("CPU ", snapshot.cpu.as_ref().map(|cpu| cpu.usage))),
+        (Metric::Memory, percent_segment("RAM ", snapshot.memory.as_ref().map(|memory| memory.percent()))),
+        (
+            Metric::Network,
+            segment_job(&[
+                ("NET ↓", LABEL_COLOR),
+                (&format::rate(network.map(|n| n.down_per_sec)), TEXT_COLOR),
+                (" ↑", LABEL_COLOR),
+                (&format::rate(network.map(|n| n.up_per_sec)), TEXT_COLOR),
+            ]),
+        ),
+        (
+            Metric::Disk,
+            segment_job(&[
+                ("DSK R", LABEL_COLOR),
+                (&format::rate(disk.and_then(|d| d.read_per_sec)), disk_color),
+                (" W", LABEL_COLOR),
+                (&format::rate(disk.and_then(|d| d.write_per_sec)), disk_color),
+            ]),
+        ),
     ]
 }
 
@@ -249,6 +281,48 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
                 format!("Swap: {} / {}", format::bytes(memory.swap_used), format::bytes(memory.swap_total)),
                 format!("Peak, last {window_secs}s: {:.0}%", peak(&shared.memory_history)),
             ]
+        }
+        Metric::Network => {
+            let Some(network) = &snapshot.network else { return vec!["Network: measuring…".to_owned()] };
+            let mut lines = vec![format!(
+                "Down {}/s   Up {}/s",
+                format::bytes(network.down_per_sec as u64),
+                format::bytes(network.up_per_sec as u64)
+            )];
+            lines.extend(network.adapters.iter().map(|a| {
+                format!(
+                    "  {}: ↓{}/s ↑{}/s",
+                    a.name,
+                    format::bytes(a.down_per_sec as u64),
+                    format::bytes(a.up_per_sec as u64)
+                )
+            }));
+            if network.adapters.is_empty() {
+                lines.push("  No active network adapters".to_owned());
+            }
+            lines
+        }
+        Metric::Disk => {
+            let Some(disk) = &snapshot.disk else { return vec!["Disk: measuring…".to_owned()] };
+            let mut lines = vec![
+                format!("Disk active: {}", format::percent(disk.active_percent).trim()),
+                format!(
+                    "Read {}/s   Write {}/s",
+                    format::rate(disk.read_per_sec).trim(),
+                    format::rate(disk.write_per_sec).trim()
+                ),
+                "Free space:".to_owned(),
+            ];
+            lines.extend(disk.volumes.iter().map(|v| {
+                let percent = if v.total == 0 { 0.0 } else { v.used as f64 / v.total as f64 * 100.0 };
+                format!(
+                    "  {}  {} free of {} ({percent:.0}% used)",
+                    v.mount,
+                    format::bytes(v.total - v.used),
+                    format::bytes(v.total)
+                )
+            }));
+            lines
         }
     }
 }

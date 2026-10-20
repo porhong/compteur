@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod format;
 mod metrics;
+mod pdh;
 mod sampler;
 
 use eframe::egui;

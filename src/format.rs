@@ -42,6 +42,12 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
+/// A transfer rate padded to 4 characters, e.g. `"1.2M"`, `" 80K"`; `"  --"` when unknown.
+pub fn rate(bytes_per_sec: Option<f64>) -> String {
+    let text = bytes_per_sec.map_or_else(|| "--".to_owned(), |v| bytes(v.max(0.0).round() as u64));
+    format!("{text:>4}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +70,13 @@ mod tests {
         assert_eq!(bytes(1536 * 1024), "1.5M");
         assert_eq!(bytes(9_800 * 1024 * 1024), "9.6G");
         assert_eq!(bytes(16 * 1024 * 1024 * 1024), "16G");
+    }
+
+    #[test]
+    fn rate_is_padded() {
+        assert_eq!(rate(Some(80.0 * 1024.0)), " 80K");
+        assert_eq!(rate(Some(1.25 * 1024.0 * 1024.0)), "1.2M");
+        assert_eq!(rate(None), "  --");
     }
 
     #[test]

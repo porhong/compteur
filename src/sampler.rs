@@ -10,7 +10,10 @@ use std::{
 use eframe::egui;
 use sysinfo::System;
 
-use crate::metrics::{Snapshot, cpu_mem};
+use crate::metrics::{
+    Snapshot, cpu_mem,
+    disk_net::{DiskSampler, NetSampler},
+};
 
 /// Seconds of history kept for sparklines (one sample per tick).
 pub const HISTORY_LEN: usize = 60;
@@ -68,16 +71,21 @@ pub fn spawn(ctx: egui::Context, interval: Duration) -> Arc<Mutex<Shared>> {
             let mut sys = System::new();
             // CPU usage is a delta between two refreshes; take the baseline now.
             sys.refresh_cpu_usage();
+            let mut disk_sampler = DiskSampler::new();
+            let mut net_sampler = NetSampler::new();
             loop {
                 thread::sleep(interval);
                 let cpu = cpu_mem::sample_cpu(&mut sys);
                 let memory = cpu_mem::sample_memory(&mut sys);
+                let disk = disk_sampler.sample();
+                let network = net_sampler.sample();
 
                 // Sample outside the lock, so the UI never waits on a slow system call.
                 let mut shared = thread_shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 shared.cpu_history.push(cpu.usage);
                 shared.memory_history.push(memory.percent());
-                shared.snapshot = Snapshot { cpu: Some(cpu), memory: Some(memory) };
+                shared.snapshot =
+                    Snapshot { cpu: Some(cpu), memory: Some(memory), disk: Some(disk), network: Some(network) };
                 drop(shared);
                 ctx.request_repaint();
             }

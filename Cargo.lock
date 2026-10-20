@@ -215,6 +215,7 @@ dependencies = [
  "serde",
  "sysinfo",
  "toml",
+ "windows",
 ]
 
 [[package]]
