@@ -16,6 +16,14 @@ impl Level {
             _ => Self::Normal,
         }
     }
+
+    pub fn for_celsius(celsius: f32) -> Self {
+        match celsius {
+            c if c >= 90.0 => Self::Hot,
+            c if c >= 75.0 => Self::Warn,
+            _ => Self::Normal,
+        }
+    }
 }
 
 /// `" 7%"`, `"42%"`, `"100%"`; `"--%"` when unknown.
@@ -24,6 +32,11 @@ pub fn percent(value: Option<f32>) -> String {
         Some(v) => format!("{:>2.0}%", v.clamp(0.0, 100.0)),
         None => "--%".to_owned(),
     }
+}
+
+/// `"45°"`; `"--°"` when unknown.
+pub fn celsius(value: Option<f32>) -> String {
+    value.map_or_else(|| "--°".to_owned(), |c| format!("{c:>2.0}°"))
 }
 
 /// Bytes with a binary unit suffix, at most 4 characters of number: `"512B"`, `"80K"`, `"9.8G"`, `"16G"`.
@@ -84,5 +97,7 @@ mod tests {
         assert_eq!(Level::for_percent(69.9), Level::Normal);
         assert_eq!(Level::for_percent(70.0), Level::Warn);
         assert_eq!(Level::for_percent(95.0), Level::Hot);
+        assert_eq!(Level::for_celsius(74.0), Level::Normal);
+        assert_eq!(Level::for_celsius(80.0), Level::Warn);
     }
 }

@@ -4,10 +4,20 @@
 //! `pid_1124_luid_0x00000000_0x0000D1E8_phys_0_eng_3_engtype_VideoDecode`: one per process per engine.
 //! An engine's load is the sum over processes; an adapter's load is its busiest engine.
 //! Names and total VRAM come from DXGI, matched to the counters by adapter LUID.
+//! Temperature comes from the kernel-mode adapter performance data that Task Manager also shows.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ffi::c_void};
 
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
+use windows::{
+    Wdk::Graphics::Direct3D::{
+        D3DKMT_ADAPTER_PERFDATA, D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
+        D3DKMTCloseAdapter, D3DKMTOpenAdapterFromLuid, D3DKMTQueryAdapterInfo, KMTQAITYPE_ADAPTERPERFDATA,
+    },
+    Win32::{
+        Foundation::LUID,
+        Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1},
+    },
+};
 
 use crate::pdh::{Counter, Query};
 
@@ -26,12 +36,19 @@ pub struct GpuAdapter {
     pub vram_used: u64,
     /// Dedicated VRAM; 0 when unknown.
     pub vram_total: u64,
+    /// Degrees Celsius; `None` when the driver doesn't report it (common for integrated GPUs).
+    pub temperature: Option<f32>,
 }
 
 impl GpuStats {
     /// Load of the busiest adapter.
     pub fn usage(&self) -> Option<f32> {
         self.adapters.iter().map(|a| a.usage).reduce(f32::max)
+    }
+
+    /// Temperature of the hottest adapter that reports one.
+    pub fn temperature(&self) -> Option<f32> {
+        self.adapters.iter().filter_map(|a| a.temperature).reduce(f32::max)
     }
 
     /// The adapter with the most dedicated memory, normally the discrete GPU.
@@ -57,6 +74,8 @@ struct KnownAdapter {
 pub struct GpuSampler {
     counters: Option<(Query, Counter, Counter)>,
     known: Vec<KnownAdapter>,
+    /// One per `known` adapter, for temperature.
+    kernel_adapters: Vec<Option<KernelAdapter>>,
 }
 
 impl GpuSampler {
@@ -69,7 +88,8 @@ impl GpuSampler {
             query.collect(); // baseline for the utilization rate
             Some((query, engines, memory))
         });
-        Self { counters, known }
+        let kernel_adapters = known.iter().map(|a| KernelAdapter::open(a.luid)).collect();
+        Self { counters, known, kernel_adapters }
     }
 
     /// `None` when there is no hardware GPU or its counters are unavailable (needs a WDDM 2 driver).
@@ -78,8 +98,45 @@ impl GpuSampler {
         if !query.collect() {
             return None;
         }
-        let adapters = aggregate(&query.values(*engines), &query.values(*memory), &self.known);
+        let mut adapters = aggregate(&query.values(*engines), &query.values(*memory), &self.known);
+        for (adapter, kernel) in adapters.iter_mut().zip(&self.kernel_adapters) {
+            adapter.temperature = kernel.as_ref().and_then(KernelAdapter::temperature);
+        }
         Some(GpuStats { adapters })
+    }
+}
+
+/// A kernel-mode (D3DKMT) adapter handle, used only to read the temperature.
+struct KernelAdapter(u32);
+
+impl KernelAdapter {
+    fn open(luid: u64) -> Option<Self> {
+        let luid = LUID { LowPart: luid as u32, HighPart: (luid >> 32) as i32 };
+        let mut open = D3DKMT_OPENADAPTERFROMLUID { AdapterLuid: luid, hAdapter: 0 };
+        // SAFETY: `open` is a valid, initialized in/out struct.
+        let status = unsafe { D3DKMTOpenAdapterFromLuid(&mut open) };
+        status.is_ok().then_some(Self(open.hAdapter))
+    }
+
+    fn temperature(&self) -> Option<f32> {
+        let mut perf = D3DKMT_ADAPTER_PERFDATA::default(); // PhysicalAdapterIndex 0
+        let mut query = D3DKMT_QUERYADAPTERINFO {
+            hAdapter: self.0,
+            Type: KMTQAITYPE_ADAPTERPERFDATA,
+            pPrivateDriverData: (&raw mut perf).cast::<c_void>(),
+            PrivateDriverDataSize: size_of::<D3DKMT_ADAPTER_PERFDATA>() as u32,
+        };
+        // SAFETY: the handle is open and `query` points at a correctly sized PERFDATA buffer.
+        let status = unsafe { D3DKMTQueryAdapterInfo(&mut query) };
+        // Reported in tenths of a degree Celsius; 0 means the driver doesn't support it.
+        (status.is_ok() && perf.Temperature > 0).then(|| perf.Temperature as f32 / 10.0)
+    }
+}
+
+impl Drop for KernelAdapter {
+    fn drop(&mut self) {
+        // SAFETY: the handle is open and closed exactly once. Nothing useful can be done if closing fails.
+        let _ = unsafe { D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: self.0 }) };
     }
 }
 
@@ -166,6 +223,7 @@ fn aggregate(engines: &[(String, f64)], memory: &[(String, f64)], known: &[Known
                 engines: kinds,
                 vram_used: vram_used.get(&adapter.luid).copied().unwrap_or(0),
                 vram_total: adapter.vram_total,
+                temperature: None, // filled in by the sampler
             }
         })
         .collect()

@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui;
@@ -15,10 +15,14 @@ use crate::metrics::{
     Snapshot, cpu_mem,
     disk_net::{DiskSampler, NetSampler},
     gpu::GpuSampler,
+    processes,
+    thermal::ThermalSampler,
 };
 
 /// Seconds of history kept for sparklines (one sample per tick).
 pub const HISTORY_LEN: usize = 60;
+/// Listing every process costs ~10 ms, so the top-apps list refreshes less often than the rest.
+const PROCESS_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Fixed-capacity buffer that drops the oldest value when full.
 #[derive(Debug, Clone)]
@@ -93,6 +97,8 @@ pub fn spawn(ctx: egui::Context, settings: Settings) -> Arc<Mutex<Shared>> {
             let mut disk_sampler = DiskSampler::new();
             let mut net_sampler = NetSampler::new();
             let mut gpu_sampler = GpuSampler::new();
+            let mut thermal_sampler = ThermalSampler::new();
+            let mut processes: Option<(Instant, Vec<processes::TopProcess>)> = None;
             loop {
                 let Settings { interval, shown } = lock(&thread_shared).settings;
                 thread::sleep(interval);
@@ -100,10 +106,16 @@ pub fn spawn(ctx: egui::Context, settings: Settings) -> Arc<Mutex<Shared>> {
                 // Hidden metrics aren't sampled at all; GPU counters in particular cost CPU time.
                 // Sample outside the lock, so the UI never waits on a slow system call.
                 let cpu = shown.cpu.then(|| cpu_mem::sample_cpu(&mut sys));
+                let cpu_temp = shown.cpu_temp.then(|| thermal_sampler.sample()).flatten();
                 let memory = shown.memory.then(|| cpu_mem::sample_memory(&mut sys));
-                let gpu = (shown.gpu || shown.vram).then(|| gpu_sampler.sample()).flatten();
+                let gpu = (shown.gpu || shown.vram || shown.gpu_temp).then(|| gpu_sampler.sample()).flatten();
                 let network = shown.network.then(|| net_sampler.sample());
                 let disk = shown.disk.then(|| disk_sampler.sample());
+                if !shown.top_process {
+                    processes = None;
+                } else if processes.as_ref().is_none_or(|(at, _)| at.elapsed() >= PROCESS_INTERVAL) {
+                    processes = Some((Instant::now(), processes::sample_processes(&mut sys)));
+                }
 
                 let mut shared = lock(&thread_shared);
                 if let Some(cpu) = &cpu {
@@ -115,7 +127,8 @@ pub fn spawn(ctx: egui::Context, settings: Settings) -> Arc<Mutex<Shared>> {
                 if let Some(usage) = gpu.as_ref().and_then(|g| g.usage()) {
                     shared.gpu_history.push(usage);
                 }
-                shared.snapshot = Snapshot { cpu, memory, gpu, disk, network };
+                let processes = processes.as_ref().map(|(_, top)| top.clone());
+                shared.snapshot = Snapshot { cpu, cpu_temp, memory, gpu, disk, network, processes };
                 drop(shared);
                 ctx.request_repaint();
             }
@@ -143,3 +156,4 @@ mod tests {
         assert_eq!(history.iter().collect::<Vec<_>>(), [2.0, 3.0, 4.0]);
     }
 }
+

@@ -10,7 +10,7 @@ use eframe::egui::{
 };
 
 use crate::{
-    config::{Config, Metric},
+    config::{Config, Metric, Shown},
     format::{self, Level},
     sampler::{self, HISTORY_LEN, History, Settings, Shared},
 };
@@ -32,6 +32,8 @@ const SAVE_DELAY: Duration = Duration::from_millis(800);
 /// Used to place the menu before its real size is known; it then resizes itself to fit.
 const MENU_SIZE: Vec2 = Vec2::new(230.0, 330.0);
 const REFRESH_CHOICES: [(u64, &str); 3] = [(500, "0.5 s"), (1000, "1 s"), (2000, "2 s")];
+/// Characters of the busiest app's name shown on the strip.
+const TOP_NAME_WIDTH: usize = 10;
 
 pub struct App {
     config: Config,
@@ -138,9 +140,8 @@ impl eframe::App for App {
 
         let mut shared = sampler::lock(&self.shared);
         shared.settings = Settings::from_config(&self.config);
-        let segments: Vec<(Metric, Arc<Galley>)> = segments(&shared)
+        let segments: Vec<(Metric, Arc<Galley>)> = segments(&shared, self.config.shown)
             .into_iter()
-            .filter(|(metric, _)| self.config.shown.get(*metric))
             .map(|(metric, job)| (metric, ui.painter().layout_job(job)))
             .collect();
         let separator = ui.painter().layout_no_wrap(SEPARATOR.to_owned(), FontId::monospace(FONT_SIZE), LABEL_COLOR);
@@ -257,19 +258,63 @@ fn percent_segment(label: &str, percent: Option<f32>) -> LayoutJob {
     segment_job(&[(label, LABEL_COLOR), (&format::percent(percent), percent_color(percent))])
 }
 
-fn segments(shared: &Shared) -> Vec<(Metric, LayoutJob)> {
+/// A load and a temperature sharing one segment, e.g. `CPU 23% 45°`.
+/// The outer `Option` says whether that part is shown; the inner one holds its value.
+fn load_and_temp_segment(label: &str, load: Option<Option<f32>>, temp: Option<Option<f32>>) -> LayoutJob {
+    let load_text = load.map(format::percent);
+    // Next to a load, an unavailable temperature is left out; on its own it shows as `--°`.
+    let temp_text = temp
+        .filter(|t| t.is_some() || load.is_none())
+        .map(|t| if load.is_some() { format!(" {}", format::celsius(t)) } else { format::celsius(t) });
+    let temp_color = level_color(temp.flatten().map_or(Level::Normal, Level::for_celsius));
+
+    let mut parts = vec![(label, LABEL_COLOR)];
+    if let Some(text) = &load_text {
+        parts.push((text, percent_color(load.flatten())));
+    }
+    if let Some(text) = &temp_text {
+        parts.push((text, temp_color));
+    }
+    segment_job(&parts)
+}
+
+/// Pads or cuts `text` to exactly `width` characters, so the strip doesn't change width.
+fn fixed_width(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        format!("{text:<width$}")
+    } else {
+        let cut: String = text.chars().take(width - 1).collect();
+        format!("{cut}…")
+    }
+}
+
+/// The visible strip segments, in strip order, each tagged with the metric its hover details describe.
+fn segments(shared: &Shared, shown: Shown) -> Vec<(Metric, LayoutJob)> {
     let snapshot = &shared.snapshot;
-    let network = snapshot.network.as_ref();
-    let disk = snapshot.disk.as_ref();
     let gpu = snapshot.gpu.as_ref();
-    // Disk rates are colored by how busy the disks are, not by throughput.
-    let disk_color = percent_color(disk.and_then(|d| d.active_percent));
-    vec![
-        (Metric::Cpu, percent_segment("CPU ", snapshot.cpu.as_ref().map(|cpu| cpu.usage))),
-        (Metric::Memory, percent_segment("RAM ", snapshot.memory.as_ref().map(|memory| memory.percent()))),
-        (Metric::Gpu, percent_segment("GPU ", gpu.and_then(|g| g.usage()))),
-        (Metric::Vram, percent_segment("VRAM ", gpu.and_then(|g| g.main_adapter()?.vram_percent()))),
-        (
+    let mut segments = Vec::new();
+
+    if shown.cpu || shown.cpu_temp {
+        let load = shown.cpu.then(|| snapshot.cpu.as_ref().map(|cpu| cpu.usage));
+        let temp = shown.cpu_temp.then_some(snapshot.cpu_temp);
+        let metric = if shown.cpu { Metric::Cpu } else { Metric::CpuTemp };
+        segments.push((metric, load_and_temp_segment("CPU ", load, temp)));
+    }
+    if shown.memory {
+        segments.push((Metric::Memory, percent_segment("RAM ", snapshot.memory.as_ref().map(|m| m.percent()))));
+    }
+    if shown.gpu || shown.gpu_temp {
+        let load = shown.gpu.then(|| gpu.and_then(|g| g.usage()));
+        let temp = shown.gpu_temp.then(|| gpu.and_then(|g| g.temperature()));
+        let metric = if shown.gpu { Metric::Gpu } else { Metric::GpuTemp };
+        segments.push((metric, load_and_temp_segment("GPU ", load, temp)));
+    }
+    if shown.vram {
+        segments.push((Metric::Vram, percent_segment("VRAM ", gpu.and_then(|g| g.main_adapter()?.vram_percent()))));
+    }
+    if shown.network {
+        let network = snapshot.network.as_ref();
+        segments.push((
             Metric::Network,
             segment_job(&[
                 ("NET ↓", LABEL_COLOR),
@@ -277,8 +322,13 @@ fn segments(shared: &Shared) -> Vec<(Metric, LayoutJob)> {
                 (" ↑", LABEL_COLOR),
                 (&format::rate(network.map(|n| n.up_per_sec)), TEXT_COLOR),
             ]),
-        ),
-        (
+        ));
+    }
+    if shown.disk {
+        let disk = snapshot.disk.as_ref();
+        // Disk rates are colored by how busy the disks are, not by throughput.
+        let disk_color = percent_color(disk.and_then(|d| d.active_percent));
+        segments.push((
             Metric::Disk,
             segment_job(&[
                 ("DSK R", LABEL_COLOR),
@@ -286,8 +336,23 @@ fn segments(shared: &Shared) -> Vec<(Metric, LayoutJob)> {
                 (" W", LABEL_COLOR),
                 (&format::rate(disk.and_then(|d| d.write_per_sec)), disk_color),
             ]),
-        ),
-    ]
+        ));
+    }
+    if shown.top_process {
+        let top = snapshot.processes.as_ref().and_then(|p| p.first());
+        let name = fixed_width(top.map_or("--", |p| p.name.as_str()), TOP_NAME_WIDTH);
+        let cpu = top.map(|p| p.cpu);
+        segments.push((
+            Metric::TopProcess,
+            segment_job(&[
+                ("TOP ", LABEL_COLOR),
+                (&name, TEXT_COLOR),
+                (" ", LABEL_COLOR),
+                (&format::percent(cpu), percent_color(cpu)),
+            ]),
+        ));
+    }
+    segments
 }
 
 fn peak(history: &History) -> f32 {
@@ -298,16 +363,24 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
     let window_secs = HISTORY_LEN as u64 * refresh_ms / 1000;
     let snapshot = &shared.snapshot;
     match metric {
-        Metric::Cpu => {
-            let Some(cpu) = &snapshot.cpu else { return vec!["CPU: measuring…".to_owned()] };
-            let mut lines = vec![
-                format!("CPU {:.0}% at {:.2} GHz", cpu.usage, cpu.frequency_mhz as f32 / 1000.0),
-                format!("Peak, last {window_secs}s: {:.0}%", peak(&shared.cpu_history)),
-                format!("{} logical cores (%):", cpu.per_core.len()),
-            ];
-            lines.extend(
-                cpu.per_core.chunks(8).map(|row| row.iter().map(|u| format!("{u:>3.0}")).collect::<Vec<_>>().join(" ")),
-            );
+        Metric::Cpu | Metric::CpuTemp => {
+            let mut lines = Vec::new();
+            if let Some(cpu) = &snapshot.cpu {
+                lines.push(format!("CPU {:.0}% at {:.2} GHz", cpu.usage, cpu.frequency_mhz as f32 / 1000.0));
+                lines.push(format!("Peak, last {window_secs}s: {:.0}%", peak(&shared.cpu_history)));
+            }
+            lines.push(match snapshot.cpu_temp {
+                Some(celsius) => format!("Temperature: {celsius:.0}°C (ACPI thermal zone)"),
+                None => "Temperature: not exposed by this PC without a driver".to_owned(),
+            });
+            if let Some(cpu) = &snapshot.cpu {
+                lines.push(format!("{} logical cores (%):", cpu.per_core.len()));
+                lines.extend(
+                    cpu.per_core
+                        .chunks(8)
+                        .map(|row| row.iter().map(|u| format!("{u:>3.0}")).collect::<Vec<_>>().join(" ")),
+                );
+            }
             lines
         }
         Metric::Memory => {
@@ -324,7 +397,7 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
                 format!("Peak, last {window_secs}s: {:.0}%", peak(&shared.memory_history)),
             ]
         }
-        Metric::Gpu | Metric::Vram => {
+        Metric::Gpu | Metric::GpuTemp | Metric::Vram => {
             let Some(gpu) = &snapshot.gpu else { return vec!["GPU: no hardware GPU counters".to_owned()] };
             let mut lines = Vec::new();
             for adapter in &gpu.adapters {
@@ -338,6 +411,9 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
                     .collect();
                 let breakdown = if busy.is_empty() { String::new() } else { format!("  ({})", busy.join(", ")) };
                 lines.push(format!("  Load {:.0}%{breakdown}", adapter.usage));
+                if let Some(celsius) = adapter.temperature {
+                    lines.push(format!("  Temperature {celsius:.0}°C"));
+                }
                 let percent = adapter.vram_percent().map_or(String::new(), |p| format!(" ({p:.0}%)"));
                 lines.push(format!(
                     "  VRAM {} / {}{percent}",
@@ -346,6 +422,15 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
                 ));
             }
             lines.push(format!("Peak load, last {window_secs}s: {:.0}%", peak(&shared.gpu_history)));
+            lines
+        }
+        Metric::TopProcess => {
+            let Some(top) = &snapshot.processes else { return vec!["Top apps: measuring…".to_owned()] };
+            let mut lines = vec!["Top apps by CPU     CPU  Memory".to_owned()];
+            lines.extend(top.iter().map(|p| {
+                let name = if p.count > 1 { format!("{} ({})", p.name, p.count) } else { p.name.clone() };
+                format!("  {} {:>4.0}%  {:>6}", fixed_width(&name, 16), p.cpu, format::bytes(p.memory))
+            }));
             lines
         }
         Metric::Network => {

@@ -6,25 +6,41 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     Cpu,
+    CpuTemp,
     Memory,
     Gpu,
+    GpuTemp,
     Vram,
     Network,
     Disk,
+    TopProcess,
 }
 
 impl Metric {
-    /// Strip order.
-    pub const ALL: [Self; 6] = [Self::Cpu, Self::Memory, Self::Gpu, Self::Vram, Self::Network, Self::Disk];
+    /// Menu order.
+    pub const ALL: [Self; 9] = [
+        Self::Cpu,
+        Self::CpuTemp,
+        Self::Memory,
+        Self::Gpu,
+        Self::GpuTemp,
+        Self::Vram,
+        Self::Network,
+        Self::Disk,
+        Self::TopProcess,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Cpu => "CPU load",
+            Self::CpuTemp => "CPU temperature",
             Self::Memory => "RAM usage",
             Self::Gpu => "GPU load",
+            Self::GpuTemp => "GPU temperature",
             Self::Vram => "GPU memory (VRAM)",
             Self::Network => "Network speed",
             Self::Disk => "Disk activity",
+            Self::TopProcess => "Top app by CPU",
         }
     }
 }
@@ -34,16 +50,29 @@ impl Metric {
 #[serde(default)]
 pub struct Shown {
     pub cpu: bool,
+    pub cpu_temp: bool,
     pub memory: bool,
     pub gpu: bool,
+    pub gpu_temp: bool,
     pub vram: bool,
     pub network: bool,
     pub disk: bool,
+    pub top_process: bool,
 }
 
 impl Default for Shown {
     fn default() -> Self {
-        Self { cpu: true, memory: true, gpu: true, vram: true, network: true, disk: true }
+        Self {
+            cpu: true,
+            cpu_temp: true,
+            memory: true,
+            gpu: true,
+            gpu_temp: true,
+            vram: true,
+            network: true,
+            disk: true,
+            top_process: true,
+        }
     }
 }
 
@@ -51,11 +80,14 @@ impl Shown {
     fn flag(&mut self, metric: Metric) -> &mut bool {
         match metric {
             Metric::Cpu => &mut self.cpu,
+            Metric::CpuTemp => &mut self.cpu_temp,
             Metric::Memory => &mut self.memory,
             Metric::Gpu => &mut self.gpu,
+            Metric::GpuTemp => &mut self.gpu_temp,
             Metric::Vram => &mut self.vram,
             Metric::Network => &mut self.network,
             Metric::Disk => &mut self.disk,
+            Metric::TopProcess => &mut self.top_process,
         }
     }
 
@@ -157,14 +189,13 @@ mod tests {
 
     #[test]
     fn all_metrics_hidden_resets_to_all_shown() {
-        let text = "[shown]
-cpu = false
-memory = false
-gpu = false
-vram = false
-network = false
-disk = false";
-        assert_eq!(Config::from_toml(text).shown, Shown::default());
+        let mut shown = Shown::default();
+        for metric in Metric::ALL {
+            shown.set(metric, false);
+        }
+        let config = Config { shown, ..Config::default() };
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(Config::from_toml(&text).shown, Shown::default());
     }
 
     #[test]
