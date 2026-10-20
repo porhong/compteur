@@ -1,0 +1,63 @@
+# Pushing a tag like v0.1.0 tests, builds and publishes compteur.exe as a GitHub release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release and upload its files
+
+env:
+  CARGO_TERM_COLOR: always
+  # The runner has Visual Studio, so CI uses MSVC rather than the admin-free gnullvm toolchain pinned
+  # in rust-toolchain.toml for local builds. This variable overrides that pin.
+  RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+  # Static C runtime, so the exe runs without the Visual C++ Redistributable.
+  RUSTFLAGS: -Ctarget-feature=+crt-static
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist
+          cp target/release/compteur.exe dist/compteur.exe
+          (cd dist && sha256sum compteur.exe > compteur.exe.sha256)
+          gh release create "$GITHUB_REF_NAME" dist/compteur.exe dist/compteur.exe.sha256 \
+            --title "Compteur $GITHUB_REF_NAME" --generate-notes
