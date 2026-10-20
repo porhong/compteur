@@ -13,6 +13,7 @@ use sysinfo::System;
 use crate::metrics::{
     Snapshot, cpu_mem,
     disk_net::{DiskSampler, NetSampler},
+    gpu::GpuSampler,
 };
 
 /// Seconds of history kept for sparklines (one sample per tick).
@@ -47,6 +48,7 @@ pub struct Shared {
     pub snapshot: Snapshot,
     pub cpu_history: History,
     pub memory_history: History,
+    pub gpu_history: History,
 }
 
 impl Default for Shared {
@@ -55,6 +57,7 @@ impl Default for Shared {
             snapshot: Snapshot::default(),
             cpu_history: History::new(HISTORY_LEN),
             memory_history: History::new(HISTORY_LEN),
+            gpu_history: History::new(HISTORY_LEN),
         }
     }
 }
@@ -73,19 +76,24 @@ pub fn spawn(ctx: egui::Context, interval: Duration) -> Arc<Mutex<Shared>> {
             sys.refresh_cpu_usage();
             let mut disk_sampler = DiskSampler::new();
             let mut net_sampler = NetSampler::new();
+            let mut gpu_sampler = GpuSampler::new();
             loop {
                 thread::sleep(interval);
                 let cpu = cpu_mem::sample_cpu(&mut sys);
                 let memory = cpu_mem::sample_memory(&mut sys);
                 let disk = disk_sampler.sample();
                 let network = net_sampler.sample();
+                let gpu = gpu_sampler.sample();
 
                 // Sample outside the lock, so the UI never waits on a slow system call.
                 let mut shared = thread_shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 shared.cpu_history.push(cpu.usage);
                 shared.memory_history.push(memory.percent());
+                if let Some(usage) = gpu.as_ref().and_then(|g| g.usage()) {
+                    shared.gpu_history.push(usage);
+                }
                 shared.snapshot =
-                    Snapshot { cpu: Some(cpu), memory: Some(memory), disk: Some(disk), network: Some(network) };
+                    Snapshot { cpu: Some(cpu), memory: Some(memory), gpu, disk: Some(disk), network: Some(network) };
                 drop(shared);
                 ctx.request_repaint();
             }

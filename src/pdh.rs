@@ -4,13 +4,16 @@
 
 use windows::{
     Win32::System::Performance::{
-        PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue, PdhOpenQueryW,
+        PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT, PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W,
+        PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
+        PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
     },
     core::{HSTRING, PCWSTR},
 };
 
 const ERROR_SUCCESS: u32 = 0;
+/// `PDH_FMT_NOCAP100`, missing from the `windows` crate: don't clamp per-instance values to 100.
+const FMT_DOUBLE_NOCAP: PDH_FMT = PDH_FMT(PDH_FMT_DOUBLE.0 | 0x8000);
 
 /// A set of counters sampled together. PDH handles are thread-bound, so this is deliberately `!Send`.
 pub struct Query {
@@ -51,6 +54,40 @@ impl Query {
         let valid = status == ERROR_SUCCESS && matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA);
         // SAFETY: PDH_FMT_DOUBLE was requested, so the union holds `doubleValue`.
         valid.then_some(unsafe { value.Anonymous.doubleValue })
+    }
+
+    /// Every instance of a wildcard counter (e.g. `\GPU Engine(*)\...`) as `(instance name, value)`.
+    /// Wildcards are re-expanded on each `collect`, so instances that come and go are picked up.
+    pub fn values(&self, counter: Counter) -> Vec<(String, f64)> {
+        // The buffer holds the item array followed by the name strings it points into.
+        let item_size = size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+        let mut buffer = Vec::new();
+        let (mut size, mut count) = (0u32, 0u32);
+        // Instances can appear between the size query and the read, so retry a few times.
+        for _ in 0..3 {
+            // SAFETY: `buffer` holds at least `size` bytes, aligned for the items; an empty buffer is a size query.
+            let status = unsafe {
+                let items = (!buffer.is_empty()).then_some(buffer.as_mut_ptr());
+                PdhGetFormattedCounterArrayW(counter.0, FMT_DOUBLE_NOCAP, &mut size, &mut count, items)
+            };
+            match status {
+                ERROR_SUCCESS if !buffer.is_empty() => break,
+                PDH_MORE_DATA => {
+                    buffer = vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); (size as usize).div_ceil(item_size)];
+                    count = 0;
+                }
+                _ => return Vec::new(),
+            }
+        }
+
+        buffer[..(count as usize).min(buffer.len())]
+            .iter()
+            .filter(|item| matches!(item.FmtValue.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA))
+            // SAFETY: `szName` points into `buffer`, which is still alive; the union holds a double.
+            .filter_map(|item| unsafe {
+                Some((item.szName.to_string().ok()?, item.FmtValue.Anonymous.doubleValue))
+            })
+            .collect()
     }
 }
 

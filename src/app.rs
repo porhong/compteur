@@ -34,6 +34,8 @@ const SAVE_DELAY: Duration = Duration::from_millis(800);
 enum Metric {
     Cpu,
     Memory,
+    Gpu,
+    Vram,
     Network,
     Disk,
 }
@@ -222,11 +224,14 @@ fn segments(shared: &Shared) -> Vec<(Metric, LayoutJob)> {
     let snapshot = &shared.snapshot;
     let network = snapshot.network.as_ref();
     let disk = snapshot.disk.as_ref();
+    let gpu = snapshot.gpu.as_ref();
     // Disk rates are colored by how busy the disks are, not by throughput.
     let disk_color = percent_color(disk.and_then(|d| d.active_percent));
     vec![
         (Metric::Cpu, percent_segment("CPU ", snapshot.cpu.as_ref().map(|cpu| cpu.usage))),
         (Metric::Memory, percent_segment("RAM ", snapshot.memory.as_ref().map(|memory| memory.percent()))),
+        (Metric::Gpu, percent_segment("GPU ", gpu.and_then(|g| g.usage()))),
+        (Metric::Vram, percent_segment("VRAM ", gpu.and_then(|g| g.main_adapter()?.vram_percent()))),
         (
             Metric::Network,
             segment_job(&[
@@ -281,6 +286,30 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
                 format!("Swap: {} / {}", format::bytes(memory.swap_used), format::bytes(memory.swap_total)),
                 format!("Peak, last {window_secs}s: {:.0}%", peak(&shared.memory_history)),
             ]
+        }
+        Metric::Gpu | Metric::Vram => {
+            let Some(gpu) = &snapshot.gpu else { return vec!["GPU: no hardware GPU counters".to_owned()] };
+            let mut lines = Vec::new();
+            for adapter in &gpu.adapters {
+                lines.push(adapter.name.clone());
+                let busy: Vec<String> = adapter
+                    .engines
+                    .iter()
+                    .filter(|(_, load)| *load >= 0.5)
+                    .take(3)
+                    .map(|(kind, load)| format!("{kind} {load:.0}%"))
+                    .collect();
+                let breakdown = if busy.is_empty() { String::new() } else { format!("  ({})", busy.join(", ")) };
+                lines.push(format!("  Load {:.0}%{breakdown}", adapter.usage));
+                let percent = adapter.vram_percent().map_or(String::new(), |p| format!(" ({p:.0}%)"));
+                lines.push(format!(
+                    "  VRAM {} / {}{percent}",
+                    format::bytes(adapter.vram_used),
+                    format::bytes(adapter.vram_total)
+                ));
+            }
+            lines.push(format!("Peak load, last {window_secs}s: {:.0}%", peak(&shared.gpu_history)));
+            lines
         }
         Metric::Network => {
             let Some(network) = &snapshot.network else { return vec!["Network: measuring…".to_owned()] };
