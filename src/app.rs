@@ -4,8 +4,8 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontId, Galley, Id, PointerButton, Pos2, Rect, Sense, Vec2, ViewportBuilder,
-    ViewportCommand, ViewportId,
+    self, Color32, CornerRadius, FontId, Galley, Id, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
+    ViewportBuilder, ViewportCommand, ViewportId,
     text::{LayoutJob, TextFormat},
 };
 
@@ -23,6 +23,12 @@ const FONT_SIZE: f32 = 13.0;
 const DETAIL_FONT_SIZE: f32 = 12.0;
 const DETAIL_PADDING: f32 = 8.0;
 const POPUP_GAP: f32 = 4.0;
+/// Popups have no OS shadow (see `platform::remove_window_shadows`), so a faint edge separates them.
+const POPUP_BORDER: Stroke = Stroke { width: 1.0, color: Color32::from_gray(70) };
+const GRAPH_HEIGHT: f32 = 36.0;
+const GRAPH_MIN_WIDTH: f32 = 180.0;
+/// Teal, matching the app icon.
+const GRAPH_COLOR: Color32 = Color32::from_rgb(90, 200, 160);
 const CORNER_RADIUS: u8 = 6;
 const SEPARATOR: &str = " │ ";
 const LABEL_COLOR: Color32 = Color32::from_gray(150);
@@ -189,6 +195,7 @@ impl App {
                 exit = menu_contents(ui, config, &mut autostart);
                 ui.min_rect().size()
             });
+            ui.painter().rect_stroke(ui.max_rect(), CornerRadius::ZERO, POPUP_BORDER, StrokeKind::Inside);
             // Fit the window to its contents plus the panel's 8 pt margin on each side.
             let wanted = (panel.inner + Vec2::splat(16.0)).ceil();
             let current = ui.ctx().input(|i| i.viewport().inner_rect).map(|r| r.size());
@@ -269,21 +276,25 @@ impl eframe::App for App {
             .filter(|_| self.menu.is_none() && menu_click.is_none() && !response.dragged())
             .and_then(|pos| spans.iter().find(|(_, span)| span.contains(&pos.x)))
             .map(|(metric, span)| (*metric, span.start));
-        let details = hovered.map(|(metric, x)| (x, detail_lines(metric, &shared, self.config.refresh_ms)));
+        let details = hovered.map(|(metric, x)| {
+            (x, detail_lines(metric, &shared, self.config.refresh_ms), detail_history(metric, &shared))
+        });
         drop(shared);
 
         if let Some(x) = menu_click {
             self.open_menu(&ctx, x);
         }
 
-        if let Some((x, lines)) = details {
+        if let Some((x, lines, history)) = details {
             let galleys: Vec<_> = lines
                 .into_iter()
                 .map(|line| ui.painter().layout_no_wrap(line, FontId::monospace(DETAIL_FONT_SIZE), TEXT_COLOR))
                 .collect();
-            show_details(&ctx, strip_origin, x - PADDING_X, monitor_height, galleys);
+            show_details(&ctx, strip_origin, x - PADDING_X, monitor_height, galleys, history);
         }
         self.show_menu(&ctx);
+        // After the popups above, so a window opened this frame never shows the shadow.
+        platform::remove_window_shadows();
     }
 }
 
@@ -585,9 +596,19 @@ fn popup_y(strip_top: f32, height: f32, monitor_height: Option<f32>) -> f32 {
 }
 
 /// Shows `lines` below the strip (or above it, near the bottom of the screen), aligned to `x`.
-fn show_details(ctx: &egui::Context, strip_origin: Pos2, x: f32, monitor_height: Option<f32>, lines: Vec<Arc<Galley>>) {
-    let width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max);
-    let height: f32 = lines.iter().map(|g| g.size().y).sum();
+/// `history` (0–100 values, oldest first) is drawn as a graph under the text.
+fn show_details(
+    ctx: &egui::Context,
+    strip_origin: Pos2,
+    x: f32,
+    monitor_height: Option<f32>,
+    lines: Vec<Arc<Galley>>,
+    history: Option<Vec<f32>>,
+) {
+    let text_width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let text_height: f32 = lines.iter().map(|g| g.size().y).sum();
+    let width = if history.is_some() { text_width.max(GRAPH_MIN_WIDTH) } else { text_width };
+    let height = text_height + if history.is_some() { DETAIL_PADDING + GRAPH_HEIGHT } else { 0.0 };
     let size = Vec2::new(width, height) + Vec2::splat(2.0 * DETAIL_PADDING);
 
     let y = popup_y(strip_origin.y, size.y, monitor_height);
@@ -598,11 +619,46 @@ fn show_details(ctx: &egui::Context, strip_origin: Pos2, x: f32, monitor_height:
     ctx.show_viewport_immediate(ViewportId::from_hash_of("details"), builder, |ui, _class| {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, CornerRadius::ZERO, Color32::from_gray(24));
+        ui.painter().rect_stroke(rect, CornerRadius::ZERO, POPUP_BORDER, StrokeKind::Inside);
         let mut pos = rect.min + Vec2::splat(DETAIL_PADDING);
         for galley in lines.clone() {
             let height = galley.size().y;
             ui.painter().galley(pos, galley, TEXT_COLOR);
             pos.y += height;
         }
+        if let Some(history) = &history {
+            let graph = Rect::from_min_size(pos + Vec2::new(0.0, DETAIL_PADDING), Vec2::new(width, GRAPH_HEIGHT));
+            draw_graph(ui.painter(), graph, history);
+        }
     });
+}
+
+/// The 0–100% history graphed under a metric's details, if it has one worth drawing.
+fn detail_history(metric: Metric, shared: &Shared) -> Option<Vec<f32>> {
+    let history = match metric {
+        Metric::Cpu | Metric::CpuTemp => &shared.cpu_history,
+        Metric::Memory => &shared.memory_history,
+        Metric::Gpu | Metric::GpuTemp => &shared.gpu_history,
+        Metric::Vram | Metric::Network | Metric::Disk | Metric::TopProcess => return None,
+    };
+    (history.iter().len() >= 2).then(|| history.iter().collect())
+}
+
+/// A 0–100% line graph with the newest value at the right edge, so a fresh history fills in from the right.
+fn draw_graph(painter: &egui::Painter, rect: Rect, values: &[f32]) {
+    let grid = Stroke::new(1.0, Color32::from_gray(60));
+    painter.rect_stroke(rect, CornerRadius::ZERO, grid, StrokeKind::Inside);
+    painter.hline(rect.x_range(), rect.center().y, Stroke::new(1.0, Color32::from_gray(40))); // 50%
+
+    let step = rect.width() / (HISTORY_LEN - 1) as f32;
+    let points: Vec<Pos2> = values
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(age, value)| {
+            let y = rect.bottom() - value.clamp(0.0, 100.0) / 100.0 * rect.height();
+            Pos2::new(rect.right() - age as f32 * step, y)
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.5, GRAPH_COLOR)));
 }

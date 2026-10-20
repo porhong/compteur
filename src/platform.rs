@@ -5,17 +5,22 @@ use std::io;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND},
+        Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM},
+        Graphics::Dwm::{
+            DWMNCRP_DISABLED, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY, DwmGetWindowAttribute,
+            DwmSetWindowAttribute,
+        },
         System::{
             Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW},
-            Threading::CreateMutexW,
+            Threading::{CreateMutexW, GetCurrentThreadId},
         },
         UI::WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-            SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+            EnumThreadWindows, GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, SW_HIDE,
+            SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
         },
     },
-    core::{HSTRING, PCWSTR, w},
+    core::{BOOL, HSTRING, PCWSTR, w},
 };
 
 /// The strip's native window. Kept as an integer so event-handler closures (which must be `Send`)
@@ -69,6 +74,37 @@ impl Window {
             SetWindowPos(self.hwnd(), Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         };
     }
+}
+
+/// Removes the Windows 11 drop shadow from this thread's windows (the strip and its popups).
+///
+/// egui-winit always requests winit's "undecorated shadow" for borderless windows, which keeps a
+/// hidden caption so DWM draws its large default shadow. DWM offers no smaller variant, so this
+/// turns DWM's non-client rendering (frame and shadow) off instead. Cheap enough to call every
+/// frame: it only writes to windows that still have it, such as a popup that just opened.
+pub fn remove_window_shadows() {
+    unsafe extern "system" fn visit(hwnd: HWND, _: LPARAM) -> BOOL {
+        let mut enabled = BOOL(0);
+        // SAFETY: `enabled` is a valid BOOL-sized out-buffer for this attribute.
+        let queried = unsafe {
+            DwmGetWindowAttribute(hwnd, DWMWA_NCRENDERING_ENABLED, (&raw mut enabled).cast(), size_of::<BOOL>() as u32)
+        };
+        if queried.is_ok() && enabled.as_bool() {
+            let policy = DWMNCRP_DISABLED;
+            // SAFETY: `policy` is a valid DWMNCRENDERINGPOLICY-sized in-buffer for this attribute.
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_NCRENDERING_POLICY,
+                    (&raw const policy).cast(),
+                    size_of_val(&policy) as u32,
+                )
+            };
+        }
+        BOOL::from(true) // keep enumerating
+    }
+    // SAFETY: enumerates windows owned by the calling thread with a callback that holds no state.
+    let _ = unsafe { EnumThreadWindows(GetCurrentThreadId(), Some(visit), LPARAM(0)) };
 }
 
 /// Returns false if another copy of the app is already running.
