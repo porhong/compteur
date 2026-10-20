@@ -1,4 +1,7 @@
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,12 +16,13 @@ pub enum Metric {
     Vram,
     Network,
     Disk,
+    SystemDrive,
     TopProcess,
 }
 
 impl Metric {
     /// Menu order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Cpu,
         Self::CpuTemp,
         Self::Memory,
@@ -27,6 +31,7 @@ impl Metric {
         Self::Vram,
         Self::Network,
         Self::Disk,
+        Self::SystemDrive,
         Self::TopProcess,
     ];
 
@@ -40,6 +45,7 @@ impl Metric {
             Self::Vram => "GPU memory (VRAM)",
             Self::Network => "Network speed",
             Self::Disk => "Disk activity",
+            Self::SystemDrive => "Drive C: space used",
             Self::TopProcess => "Top app by CPU",
         }
     }
@@ -57,6 +63,7 @@ pub struct Shown {
     pub vram: bool,
     pub network: bool,
     pub disk: bool,
+    pub system_drive: bool,
     pub top_process: bool,
 }
 
@@ -71,6 +78,8 @@ impl Default for Shown {
             vram: true,
             network: true,
             disk: true,
+            // Off by default: free space changes slowly, so it's opt-in from the menu.
+            system_drive: false,
             top_process: true,
         }
     }
@@ -87,6 +96,7 @@ impl Shown {
             Metric::Vram => &mut self.vram,
             Metric::Network => &mut self.network,
             Metric::Disk => &mut self.disk,
+            Metric::SystemDrive => &mut self.system_drive,
             Metric::TopProcess => &mut self.top_process,
         }
     }
@@ -141,12 +151,18 @@ impl Config {
         directories::ProjectDirs::from("", "", "compteur").map(|dirs| dirs.config_dir().join("config.toml"))
     }
 
+    fn tmp_path(path: &Path) -> PathBuf {
+        path.with_extension("toml.tmp")
+    }
+
     /// Loads the config, falling back to defaults if the file is missing or unreadable.
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .map(|text| Self::from_toml(&text))
-            .unwrap_or_default()
+        let path = Self::path();
+        if let Some(path) = &path {
+            // Left behind only if the app died mid-save; the real config is still intact.
+            let _ = fs::remove_file(Self::tmp_path(path));
+        }
+        path.and_then(|path| fs::read_to_string(path).ok()).map(|text| Self::from_toml(&text)).unwrap_or_default()
     }
 
     fn from_toml(text: &str) -> Self {
@@ -166,9 +182,12 @@ impl Config {
             fs::create_dir_all(dir)?;
         }
         let text = toml::to_string_pretty(self).map_err(io::Error::other)?;
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, text)?;
-        fs::rename(tmp, path)
+        let tmp = Self::tmp_path(&path);
+        let result = fs::write(&tmp, text).and_then(|()| fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = fs::remove_file(tmp); // don't leave a stray file next to the config
+        }
+        result
     }
 }
 

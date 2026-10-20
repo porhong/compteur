@@ -32,6 +32,7 @@ Settings are saved to `%APPDATA%\compteur\config\config.toml`.
 - **VRAM**: dedicated memory used on the GPU with the most video memory.
 - **NET**: download/upload speed over physical adapters (virtual switches are skipped so traffic isn't counted twice).
 - **DSK**: read/write speed of all physical disks; colored by how busy the disks are. Hover for free space per drive.
+- **C:**: how full the Windows drive is (off by default; turn it on in the menu). Checked every 30 s.
 - **TOP**: the app using the most CPU, grouped by name (all `chrome.exe` processes count as one). Refreshes every 3 s.
 
 ## Known limits
@@ -39,6 +40,10 @@ Settings are saved to `%APPDATA%\compteur\config\config.toml`.
 - **CPU temperature** only appears on PCs whose firmware exposes an ACPI thermal zone (many laptops do, many desktops don't). Reading the CPU die directly needs a kernel driver, which this app avoids.
 - **Exclusive-fullscreen games** draw over every window, including this one. Borderless/windowed games are fine.
 - Hidden metrics are not sampled at all, so turning off GPU (the most expensive counters) lowers CPU use further.
+
+## Disk use
+
+Compteur stores one small settings file, `%APPDATA%\compteur\config\config.toml`, and nothing else: no logs or caches. To remove every trace, turn off "Start with Windows", exit, and delete that folder.
 
 ## Building
 
@@ -79,5 +84,5 @@ The release workflow checks that the tag matches `Cargo.toml`, runs the tests an
 | `src/platform.rs` | Win32 bits egui doesn't expose: Alt-Tab hiding, topmost, shadows, autostart |
 | `src/controls.rs` | Tray icon and global hotkeys |
 | `src/icon.rs`, `build.rs` | Window icon; embeds `assets/compteur.ico` in the exe (also used by the tray) |
-| `tools/make_icon.py` | Regenerates `assets/` from `logo.jfif` (`python tools/make_icon.py logo.jfif assets`, needs Pillow and NumPy) |
+| `tools/make_icon.py` | Regenerates `assets/` from `logo.png` (`python tools/make_icon.py logo.png assets`, needs Pillow and NumPy) |
 | `.github/workflows/release.yml` | Pushing a `v*` tag tests, builds and publishes a GitHub release |

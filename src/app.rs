@@ -23,7 +23,10 @@ const FONT_SIZE: f32 = 13.0;
 const DETAIL_FONT_SIZE: f32 = 12.0;
 const DETAIL_PADDING: f32 = 8.0;
 const POPUP_GAP: f32 = 4.0;
-/// Popups have no OS shadow (see `platform::remove_window_shadows`), so a faint edge separates them.
+const DETAILS_FADE_SECS: f32 = 0.12;
+/// Time constant of the details popup's glide between segments.
+const DETAILS_GLIDE_SECS: f32 = 0.05;
+/// Popups have no OS shadow (see `platform::remove_window_frames`), so a faint edge separates them.
 const POPUP_BORDER: Stroke = Stroke { width: 1.0, color: Color32::from_gray(70) };
 const GRAPH_HEIGHT: f32 = 36.0;
 const GRAPH_MIN_WIDTH: f32 = 180.0;
@@ -59,6 +62,7 @@ pub struct App {
     /// Click-through state last sent to the window and the tray, to apply changes once.
     applied: Option<(bool, bool)>,
     raised_at: Instant,
+    details: Option<Details>,
 }
 
 struct MenuState {
@@ -98,6 +102,7 @@ impl App {
             autostart,
             applied: None,
             raised_at: Instant::now(),
+            details: None,
         }
     }
 
@@ -277,7 +282,7 @@ impl eframe::App for App {
             .hover_pos()
             .filter(|_| self.menu.is_none() && menu_click.is_none() && !response.dragged())
             .and_then(|pos| spans.iter().find(|(_, span)| span.contains(&pos.x)))
-            .map(|(metric, span)| (*metric, span.start));
+            .map(|(metric, span)| (*metric, (span.start + span.end) / 2.0));
         let details = hovered.map(|(metric, x)| {
             (x, detail_lines(metric, &shared, self.config.refresh_ms), detail_history(metric, &shared))
         });
@@ -292,11 +297,27 @@ impl eframe::App for App {
                 .into_iter()
                 .map(|line| ui.painter().layout_no_wrap(line, FontId::monospace(DETAIL_FONT_SIZE), TEXT_COLOR))
                 .collect();
-            show_details(&ctx, Anchor::of(&ctx, self.window), x - PADDING_X, galleys, history);
+            let next = Details::new(Anchor::of(&ctx, self.window), x, galleys, history);
+            match &mut self.details {
+                Some(current) => current.retarget(next), // glide over from where it is now
+                None => self.details = Some(next),
+            }
+        }
+        if let Some(details) = &mut self.details {
+            let dt = ctx.input(|i| i.stable_dt).min(0.1);
+            if details.animate(hovered.is_some(), dt) {
+                ctx.request_repaint();
+            }
+            if details.opacity == 0.0 && hovered.is_none() {
+                self.details = None; // faded out
+            }
+        }
+        if let Some(details) = &self.details {
+            show_details(&ctx, details);
         }
         self.show_menu(&ctx);
         // After the popups above, so a window opened this frame never shows the shadow.
-        platform::remove_window_shadows();
+        platform::remove_window_frames();
     }
 }
 
@@ -451,6 +472,11 @@ fn segments(shared: &Shared, shown: Shown) -> Vec<(Metric, LayoutJob)> {
             ]),
         ));
     }
+    if shown.system_drive {
+        let volume = snapshot.disk.as_ref().and_then(|d| d.system_volume());
+        let label = format!("{} ", volume.map_or("C:", |v| v.name()));
+        segments.push((Metric::SystemDrive, percent_segment(&label, volume.map(|v| v.used_percent()))));
+    }
     if shown.top_process {
         let top = snapshot.processes.as_ref().and_then(|p| p.first());
         let name = fixed_width(top.map_or("--", |p| p.name.as_str()), TOP_NAME_WIDTH);
@@ -578,15 +604,31 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
                 "Free space:".to_owned(),
             ];
             lines.extend(disk.volumes.iter().map(|v| {
-                let percent = if v.total == 0 { 0.0 } else { v.used as f64 / v.total as f64 * 100.0 };
                 format!(
-                    "  {}  {} free of {} ({percent:.0}% used)",
-                    v.mount,
+                    "  {}  {} free of {} ({:.0}% used)",
+                    v.name(),
                     format::bytes(v.total - v.used),
-                    format::bytes(v.total)
+                    format::bytes(v.total),
+                    v.used_percent()
                 )
             }));
             lines
+        }
+        Metric::SystemDrive => {
+            let Some(volume) = snapshot.disk.as_ref().and_then(|d| d.system_volume()) else {
+                return vec!["System drive: measuring…".to_owned()];
+            };
+            vec![
+                format!("Drive {} (Windows)", volume.name()),
+                format!(
+                    "Used {} / {} ({:.0}%)",
+                    format::bytes(volume.used),
+                    format::bytes(volume.total),
+                    volume.used_percent()
+                ),
+                format!("Free {}", format::bytes(volume.total - volume.used)),
+                "Checked every 30 s".to_owned(),
+            ]
         }
     }
 }
@@ -641,31 +683,69 @@ impl Anchor {
     }
 }
 
-/// Shows `lines` next to the strip, aligned to `x` and kept on screen.
-/// `history` (0–100 values, oldest first) is drawn as a graph under the text.
-fn show_details(ctx: &egui::Context, anchor: Anchor, x: f32, lines: Vec<Arc<Galley>>, history: Option<Vec<f32>>) {
-    let text_width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max);
-    let text_height: f32 = lines.iter().map(|g| g.size().y).sum();
-    let width = if history.is_some() { text_width.max(GRAPH_MIN_WIDTH) } else { text_width };
-    let height = text_height + if history.is_some() { DETAIL_PADDING + GRAPH_HEIGHT } else { 0.0 };
-    let size = Vec2::new(width, height) + Vec2::splat(2.0 * DETAIL_PADDING);
+/// The hover popup for one segment. Kept for a moment after the pointer leaves, so it can fade out.
+struct Details {
+    lines: Vec<Arc<Galley>>,
+    /// 0–100 values, oldest first, drawn as a graph under the text.
+    history: Option<Vec<f32>>,
+    size: Vec2,
+    target: Pos2,
+    /// Where the popup is now; glides toward `target` when the pointer moves to another segment.
+    position: Pos2,
+    opacity: f32,
+}
 
-    let size = size.ceil();
-    let builder = popup_builder("Compteur details", anchor.popup_position(x, size), size)
+impl Details {
+    /// A popup centered on `center_x` (the hovered segment's middle) and kept on screen.
+    fn new(anchor: Anchor, center_x: f32, lines: Vec<Arc<Galley>>, history: Option<Vec<f32>>) -> Self {
+        let text_width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max);
+        let text_height: f32 = lines.iter().map(|g| g.size().y).sum();
+        let width = if history.is_some() { text_width.max(GRAPH_MIN_WIDTH) } else { text_width };
+        let height = text_height + if history.is_some() { DETAIL_PADDING + GRAPH_HEIGHT } else { 0.0 };
+        let size = (Vec2::new(width, height) + Vec2::splat(2.0 * DETAIL_PADDING)).ceil();
+        let target = anchor.popup_position(center_x - size.x / 2.0, size);
+        Self { lines, history, size, target, position: target, opacity: 0.0 }
+    }
+
+    /// Takes `next`'s content and destination, keeping the current position and opacity.
+    fn retarget(&mut self, next: Self) {
+        *self = Self { position: self.position, opacity: self.opacity, ..next };
+    }
+
+    /// Advances the fade and the glide by `dt` seconds. Returns true while still animating.
+    fn animate(&mut self, visible: bool, dt: f32) -> bool {
+        let fade = dt / DETAILS_FADE_SECS;
+        self.opacity = if visible { (self.opacity + fade).min(1.0) } else { (self.opacity - fade).max(0.0) };
+        // Exponential ease-out: covers most of the distance quickly, then settles.
+        let t = 1.0 - (-dt / DETAILS_GLIDE_SECS).exp();
+        self.position = self.position.lerp(self.target, t);
+        if self.position.distance(self.target) < 0.5 {
+            self.position = self.target;
+        }
+        let fading = if visible { self.opacity < 1.0 } else { self.opacity > 0.0 };
+        fading || self.position != self.target
+    }
+}
+
+fn show_details(ctx: &egui::Context, details: &Details) {
+    let builder = popup_builder("Compteur details", details.position, details.size)
         .with_active(false)
-        .with_mouse_passthrough(true);
+        .with_mouse_passthrough(true)
+        .with_transparent(true); // for the fade
 
     ctx.show_viewport_immediate(ViewportId::from_hash_of("details"), builder, |ui, _class| {
+        ui.set_opacity(details.opacity);
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, CornerRadius::ZERO, Color32::from_gray(24));
         ui.painter().rect_stroke(rect, CornerRadius::ZERO, POPUP_BORDER, StrokeKind::Inside);
         let mut pos = rect.min + Vec2::splat(DETAIL_PADDING);
-        for galley in lines.clone() {
+        for galley in &details.lines {
             let height = galley.size().y;
-            ui.painter().galley(pos, galley, TEXT_COLOR);
+            ui.painter().galley(pos, Arc::clone(galley), TEXT_COLOR);
             pos.y += height;
         }
-        if let Some(history) = &history {
+        if let Some(history) = &details.history {
+            let width = details.size.x - 2.0 * DETAIL_PADDING;
             let graph = Rect::from_min_size(pos + Vec2::new(0.0, DETAIL_PADDING), Vec2::new(width, GRAPH_HEIGHT));
             draw_graph(ui.painter(), graph, history);
         }
@@ -678,7 +758,7 @@ fn detail_history(metric: Metric, shared: &Shared) -> Option<Vec<f32>> {
         Metric::Cpu | Metric::CpuTemp => &shared.cpu_history,
         Metric::Memory => &shared.memory_history,
         Metric::Gpu | Metric::GpuTemp => &shared.gpu_history,
-        Metric::Vram | Metric::Network | Metric::Disk | Metric::TopProcess => return None,
+        Metric::Vram | Metric::Network | Metric::Disk | Metric::SystemDrive | Metric::TopProcess => return None,
     };
     (history.iter().len() >= 2).then(|| history.iter().collect())
 }
@@ -739,6 +819,38 @@ mod tests {
     fn popup_taller_than_both_sides_stays_on_screen() {
         let position = anchor_at(0.0, 300.0).popup_position(0.0, Vec2::new(200.0, 600.0));
         assert!(position.y >= 0.0 && position.y + 600.0 <= SCREEN.bottom());
+    }
+
+    fn details_at(position: Pos2, target: Pos2) -> Details {
+        Details { lines: Vec::new(), history: None, size: MENU, target, position, opacity: 0.0 }
+    }
+
+    #[test]
+    fn details_fade_in_then_stop_animating() {
+        let mut details = details_at(Pos2::ZERO, Pos2::ZERO);
+        assert!(details.animate(true, DETAILS_FADE_SECS / 2.0));
+        assert!(!details.animate(true, DETAILS_FADE_SECS));
+        assert_eq!(details.opacity, 1.0);
+    }
+
+    #[test]
+    fn details_glide_to_the_next_segment() {
+        let mut details = details_at(Pos2::ZERO, Pos2::new(100.0, 0.0));
+        details.opacity = 1.0;
+        details.animate(true, 1.0 / 60.0);
+        assert!(details.position.x > 0.0 && details.position.x < 100.0, "moves part of the way each frame");
+        for _ in 0..60 {
+            details.animate(true, 1.0 / 60.0);
+        }
+        assert_eq!(details.position, details.target);
+    }
+
+    #[test]
+    fn details_fade_out() {
+        let mut details = details_at(Pos2::ZERO, Pos2::ZERO);
+        details.opacity = 1.0;
+        assert!(!details.animate(false, 1.0));
+        assert_eq!(details.opacity, 0.0);
     }
 
     #[test]

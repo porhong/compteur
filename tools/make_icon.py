@@ -1,29 +1,30 @@
-# Regenerates assets/ from logo.jfif (a navy gauge on a baked-in checkerboard):
-#   python tools/make_icon.py logo.jfif assets
+# Regenerates assets/ from logo.png (a rounded-square app tile on a transparent background):
+#   python tools/make_icon.py logo.png assets
 # Needs Pillow and NumPy.
 import sys
 from PIL import Image
 import numpy as np
 
-src, out_dir = sys.argv[1], sys.argv[2]
-img = np.asarray(Image.open(src).convert("RGB")).astype(np.float32)
-lum = img @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-# Background (checkerboard + faint reflections) is light gray/white; the gauge is dark navy.
-BG, FG = 215.0, 130.0
-alpha = np.clip((BG - lum) / (BG - FG), 0, 1)
-# Un-blend edge pixels from the light background so they don't keep a pale fringe.
-bg = 240.0
-a = np.maximum(alpha, 1e-3)[..., None]
-color = np.clip((img - (1 - a) * bg) / a, 0, 255)
-rgba = np.dstack([color, alpha * 255]).astype(np.uint8)
-im = Image.fromarray(rgba, "RGBA")
+# Tile corner radius as a share of its width; pixels outside the rounded tile (stray glow) are cut.
+CORNER = 0.13
 
-ys, xs = np.nonzero(alpha > 0.2)
+src, out_dir = sys.argv[1], sys.argv[2]
+rgba = np.asarray(Image.open(src).convert("RGBA")).astype(np.float32)
+ys, xs = np.nonzero(rgba[..., 3] > 240)
 left, top, right, bottom = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
-im = im.crop((left, top, right, bottom))
-side = int(max(im.size) * 1.04)
+tile = rgba[top:bottom, left:right]
+
+h, w = tile.shape[:2]
+r = CORNER * w
+fy, fx = np.mgrid[0:h, 0:w] + 0.5
+dx = np.maximum(np.maximum(r - fx, fx - (w - r)), 0)
+dy = np.maximum(np.maximum(r - fy, fy - (h - r)), 0)
+inside = np.clip(r - np.hypot(dx, dy) + 0.5, 0, 1)  # 1 px anti-aliased edge
+tile[..., 3] *= inside
+
+side = max(w, h)
 square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-square.paste(im, ((side - im.width) // 2, (side - im.height) // 2))
+square.paste(Image.fromarray(tile.astype(np.uint8), "RGBA"), ((side - w) // 2, (side - h) // 2))
 
 big = square.resize((256, 256), Image.LANCZOS)
 big.save(f"{out_dir}/logo-256.png")

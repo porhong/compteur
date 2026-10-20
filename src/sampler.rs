@@ -110,7 +110,8 @@ pub fn spawn(ctx: egui::Context, settings: Settings) -> Arc<Mutex<Shared>> {
                 let memory = shown.memory.then(|| cpu_mem::sample_memory(&mut sys));
                 let gpu = (shown.gpu || shown.vram || shown.gpu_temp).then(|| gpu_sampler.sample()).flatten();
                 let network = shown.network.then(|| net_sampler.sample());
-                let disk = shown.disk.then(|| disk_sampler.sample());
+                // Drive space comes with the disk sample (cached for 30 s), so either metric needs it.
+                let disk = (shown.disk || shown.system_drive).then(|| disk_sampler.sample());
                 if !shown.top_process {
                     processes = None;
                 } else if processes.as_ref().is_none_or(|(at, _)| at.elapsed() >= PROCESS_INTERVAL) {

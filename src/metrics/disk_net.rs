@@ -20,6 +20,25 @@ pub struct Volume {
     pub total: u64,
 }
 
+impl DiskStats {
+    /// The volume Windows runs from (`%SystemDrive%`, almost always `C:`).
+    pub fn system_volume(&self) -> Option<&Volume> {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned()).to_uppercase();
+        self.volumes.iter().find(|v| v.mount.to_uppercase().starts_with(&drive))
+    }
+}
+
+impl Volume {
+    pub fn used_percent(&self) -> f32 {
+        if self.total == 0 { 0.0 } else { (self.used as f64 / self.total as f64 * 100.0) as f32 }
+    }
+
+    /// `C:` rather than `C:\`.
+    pub fn name(&self) -> &str {
+        self.mount.trim_end_matches('\\')
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetStats {
     pub down_per_sec: f64,
@@ -144,6 +163,14 @@ fn is_physical(name: &str, mac_unspecified: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_name_and_usage() {
+        let volume = Volume { mount: r"C:\".to_owned(), used: 25, total: 100 };
+        assert_eq!(volume.name(), "C:");
+        assert_eq!(volume.used_percent(), 25.0);
+        assert_eq!(Volume { total: 0, ..volume }.used_percent(), 0.0);
+    }
 
     #[test]
     fn filters_virtual_adapters() {

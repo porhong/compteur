@@ -1,4 +1,4 @@
-//! The app icon. `assets/` is generated from `logo.jfif` by `tools/make_icon.py`.
+//! The app icon. `assets/` is generated from `logo.png` by `tools/make_icon.py`.
 
 /// Resource ordinal of the icon `build.rs` embeds in the exe.
 pub const RESOURCE_ID: u16 = 1;

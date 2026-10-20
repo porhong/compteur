@@ -5,7 +5,9 @@ use std::io;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
-        Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM},
+        Foundation::{
+            ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
+        },
         Graphics::Dwm::{
             DWMNCRP_DISABLED, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY, DwmGetWindowAttribute,
             DwmSetWindowAttribute,
@@ -15,10 +17,13 @@ use windows::{
             Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW},
             Threading::{CreateMutexW, GetCurrentThreadId},
         },
-        UI::WindowsAndMessaging::{
-            EnumThreadWindows, GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, SW_HIDE,
-            SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-            WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        UI::{
+            Shell::{DefSubclassProc, SetWindowSubclass},
+            WindowsAndMessaging::{
+                EnumThreadWindows, GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, SW_HIDE,
+                SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+                SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_NCCALCSIZE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+            },
         },
     },
     core::{BOOL, HSTRING, PCWSTR, w},
@@ -87,13 +92,31 @@ impl Window {
     }
 }
 
-/// Removes the Windows 11 drop shadow from this thread's windows (the strip and its popups).
+/// Removes the Windows 11 drop shadow and the 1 px top border from this thread's windows (the strip
+/// and its popups).
 ///
 /// egui-winit always requests winit's "undecorated shadow" for borderless windows, which keeps a
 /// hidden caption so DWM draws its large default shadow. DWM offers no smaller variant, so this
-/// turns DWM's non-client rendering (frame and shadow) off instead. Cheap enough to call every
-/// frame: it only writes to windows that still have it, such as a popup that just opened.
-pub fn remove_window_shadows() {
+/// turns DWM's non-client rendering (frame and shadow) off instead. Without the shadow, winit's
+/// matching hack (a 1 px non-client strip along the top) only shows as a thin line, so a subclass
+/// makes the whole window client area. Cheap enough to call every frame: it only acts on windows
+/// it hasn't handled yet, such as a popup that just opened.
+pub fn remove_window_frames() {
+    unsafe extern "system" fn frameless(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        if msg == WM_NCCALCSIZE && wparam.0 != 0 {
+            return LRESULT(0); // client area = the whole window
+        }
+        // SAFETY: forwards the message unchanged to the next handler (winit's window procedure).
+        unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    }
+
     unsafe extern "system" fn visit(hwnd: HWND, _: LPARAM) -> BOOL {
         let mut enabled = BOOL(0);
         // SAFETY: `enabled` is a valid BOOL-sized out-buffer for this attribute.
@@ -111,12 +134,22 @@ pub fn remove_window_shadows() {
                     size_of_val(&policy) as u32,
                 )
             };
+            // SAFETY: subclasses a window owned by this thread with a stateless procedure; the
+            // frame change makes Windows re-ask WM_NCCALCSIZE, now answered by `frameless`.
+            unsafe {
+                if SetWindowSubclass(hwnd, Some(frameless), FRAMELESS_SUBCLASS_ID, 0).as_bool() {
+                    let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+                    let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, flags);
+                }
+            }
         }
         BOOL::from(true) // keep enumerating
     }
     // SAFETY: enumerates windows owned by the calling thread with a callback that holds no state.
     let _ = unsafe { EnumThreadWindows(GetCurrentThreadId(), Some(visit), LPARAM(0)) };
 }
+
+const FRAMELESS_SUBCLASS_ID: usize = 1;
 
 /// Returns false if another copy of the app is already running.
 /// The mutex handle is deliberately never closed: Windows releases it when this process exits.
