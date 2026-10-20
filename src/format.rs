@@ -1,7 +1,7 @@
 //! Compact, fixed-width text for the strip. Fixed widths keep the strip from jittering as values change.
 
-/// How alarming a value is; the strip colors values by this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How alarming a value is; the strip colors values by this. Ordered, so `max` picks the worse one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
     Normal,
     Warn,

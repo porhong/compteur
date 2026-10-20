@@ -15,8 +15,6 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-const WINDOW_ICON_SIZE: u32 = 64;
-
 fn main() -> eframe::Result {
     if !platform::claim_single_instance() {
         return Ok(()); // the running copy is reachable from the tray
@@ -24,9 +22,9 @@ fn main() -> eframe::Result {
     let config = config::Config::load();
 
     let icon = egui::IconData {
-        rgba: icon::icon_rgba(WINDOW_ICON_SIZE),
-        width: WINDOW_ICON_SIZE,
-        height: WINDOW_ICON_SIZE,
+        rgba: icon::window_icon_rgba(),
+        width: icon::WINDOW_ICON_SIZE,
+        height: icon::WINDOW_ICON_SIZE,
     };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Compteur")

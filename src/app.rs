@@ -62,7 +62,11 @@ pub struct App {
 }
 
 struct MenuState {
-    position: Pos2,
+    anchor: Anchor,
+    x: f32,
+    /// Starts at `MENU_SIZE` and becomes the measured size, which also re-places the menu so it
+    /// never hangs over the strip or off the screen.
+    size: Vec2,
     /// The menu closes on focus loss, but only after it has had focus once.
     was_focused: bool,
 }
@@ -98,11 +102,8 @@ impl App {
     }
 
     /// Opens the settings menu `x` points from the strip's left edge.
-    fn open_menu(&mut self, ctx: &egui::Context, x: f32) {
-        let strip_origin = ctx.input(|i| i.viewport().outer_rect).map_or(Pos2::ZERO, |r| r.min);
-        let monitor_height = ctx.input(|i| i.viewport().monitor_size).map(|s| s.y);
-        let y = popup_y(strip_origin.y, MENU_SIZE.y, monitor_height);
-        self.menu = Some(MenuState { position: Pos2::new(strip_origin.x + x, y), was_focused: false });
+    fn open_menu(&mut self, anchor: Anchor, x: f32) {
+        self.menu = Some(MenuState { anchor, x, size: MENU_SIZE, was_focused: false });
     }
 
     /// Applies tray-menu and hotkey actions. Showing/hiding and autostart were already done by the
@@ -113,7 +114,7 @@ impl App {
             match action {
                 Action::ToggleVisible => {}
                 Action::ToggleClickThrough => self.config.click_through = !self.config.click_through,
-                Action::OpenSettings => self.open_menu(ctx, 0.0),
+                Action::OpenSettings => self.open_menu(Anchor::of(ctx, self.window), 0.0),
                 Action::ToggleAutostart => self.autostart = platform::autostart_enabled(),
                 Action::Exit => {
                     self.save_now();
@@ -182,7 +183,8 @@ impl App {
 
         let config = &mut self.config;
         let mut autostart = self.autostart;
-        let builder = popup_builder("Compteur menu", menu.position, MENU_SIZE);
+        let position = menu.anchor.popup_position(menu.x, menu.size);
+        let builder = popup_builder("Compteur menu", position, menu.size);
         ctx.show_viewport_immediate(ViewportId::from_hash_of("menu"), builder, |ui, _class| {
             let focused = ui.ctx().input(|i| i.viewport().focused);
             menu.was_focused |= focused == Some(true);
@@ -198,9 +200,11 @@ impl App {
             ui.painter().rect_stroke(ui.max_rect(), CornerRadius::ZERO, POPUP_BORDER, StrokeKind::Inside);
             // Fit the window to its contents plus the panel's 8 pt margin on each side.
             let wanted = (panel.inner + Vec2::splat(16.0)).ceil();
-            let current = ui.ctx().input(|i| i.viewport().inner_rect).map(|r| r.size());
-            if current.is_some_and(|current| (current - wanted).length() > 1.0) {
+            if (menu.size - wanted).length() > 1.0 {
+                menu.size = wanted;
+                let position = menu.anchor.popup_position(menu.x, wanted);
                 ui.ctx().send_viewport_cmd(ViewportCommand::InnerSize(wanted));
+                ui.ctx().send_viewport_cmd(ViewportCommand::OuterPosition(position));
             }
         });
 
@@ -266,8 +270,6 @@ impl eframe::App for App {
         if response.drag_started_by(PointerButton::Primary) && !self.config.locked {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
-        let strip_origin = ctx.input(|i| i.viewport().outer_rect).map_or(Pos2::ZERO, |r| r.min);
-        let monitor_height = ctx.input(|i| i.viewport().monitor_size).map(|s| s.y);
         let menu_click = response.secondary_clicked().then(|| response.interact_pointer_pos().map_or(0.0, |p| p.x));
 
         // Details for the hovered segment, unless the menu or a drag is in progress.
@@ -282,7 +284,7 @@ impl eframe::App for App {
         drop(shared);
 
         if let Some(x) = menu_click {
-            self.open_menu(&ctx, x);
+            self.open_menu(Anchor::of(&ctx, self.window), x);
         }
 
         if let Some((x, lines, history)) = details {
@@ -290,7 +292,7 @@ impl eframe::App for App {
                 .into_iter()
                 .map(|line| ui.painter().layout_no_wrap(line, FontId::monospace(DETAIL_FONT_SIZE), TEXT_COLOR))
                 .collect();
-            show_details(&ctx, strip_origin, x - PADDING_X, monitor_height, galleys, history);
+            show_details(&ctx, Anchor::of(&ctx, self.window), x - PADDING_X, galleys, history);
         }
         self.show_menu(&ctx);
         // After the popups above, so a window opened this frame never shows the shadow.
@@ -349,12 +351,22 @@ fn segment_job(parts: &[(&str, Color32)]) -> LayoutJob {
     job
 }
 
+fn percent_level(percent: Option<f32>) -> Level {
+    percent.map_or(Level::Normal, Level::for_percent)
+}
+
 fn percent_color(percent: Option<f32>) -> Color32 {
-    level_color(percent.map_or(Level::Normal, Level::for_percent))
+    level_color(percent_level(percent))
+}
+
+/// A segment's label takes its value's warning color too, so a busy segment stands out at a glance.
+fn label_color(level: Level) -> Color32 {
+    if level == Level::Normal { LABEL_COLOR } else { level_color(level) }
 }
 
 fn percent_segment(label: &str, percent: Option<f32>) -> LayoutJob {
-    segment_job(&[(label, LABEL_COLOR), (&format::percent(percent), percent_color(percent))])
+    let level = percent_level(percent);
+    segment_job(&[(label, label_color(level)), (&format::percent(percent), level_color(level))])
 }
 
 /// A load and a temperature sharing one segment, e.g. `CPU 23% 45°`.
@@ -365,14 +377,15 @@ fn load_and_temp_segment(label: &str, load: Option<Option<f32>>, temp: Option<Op
     let temp_text = temp
         .filter(|t| t.is_some() || load.is_none())
         .map(|t| if load.is_some() { format!(" {}", format::celsius(t)) } else { format::celsius(t) });
-    let temp_color = level_color(temp.flatten().map_or(Level::Normal, Level::for_celsius));
+    let load_level = percent_level(load.flatten());
+    let temp_level = temp.flatten().map_or(Level::Normal, Level::for_celsius);
 
-    let mut parts = vec![(label, LABEL_COLOR)];
+    let mut parts = vec![(label, label_color(load_level.max(temp_level)))];
     if let Some(text) = &load_text {
-        parts.push((text, percent_color(load.flatten())));
+        parts.push((text, level_color(load_level)));
     }
     if let Some(text) = &temp_text {
-        parts.push((text, temp_color));
+        parts.push((text, level_color(temp_level)));
     }
     segment_job(&parts)
 }
@@ -426,13 +439,14 @@ fn segments(shared: &Shared, shown: Shown) -> Vec<(Metric, LayoutJob)> {
     if shown.disk {
         let disk = snapshot.disk.as_ref();
         // Disk rates are colored by how busy the disks are, not by throughput.
-        let disk_color = percent_color(disk.and_then(|d| d.active_percent));
+        let disk_level = percent_level(disk.and_then(|d| d.active_percent));
+        let disk_color = level_color(disk_level);
         segments.push((
             Metric::Disk,
             segment_job(&[
-                ("DSK R", LABEL_COLOR),
+                ("DSK R", label_color(disk_level)),
                 (&format::rate(disk.and_then(|d| d.read_per_sec)), disk_color),
-                (" W", LABEL_COLOR),
+                (" W", label_color(disk_level)),
                 (&format::rate(disk.and_then(|d| d.write_per_sec)), disk_color),
             ]),
         ));
@@ -589,30 +603,55 @@ fn popup_builder(title: &str, position: Pos2, size: Vec2) -> ViewportBuilder {
         .with_taskbar(false)
 }
 
-/// Top of a popup `height` tall: below the strip, or above it when it would run off the screen.
-fn popup_y(strip_top: f32, height: f32, monitor_height: Option<f32>) -> f32 {
-    let below = strip_top + STRIP_HEIGHT + POPUP_GAP;
-    if monitor_height.is_none_or(|h| below + height <= h) { below } else { strip_top - POPUP_GAP - height }
+/// What popups are placed against: the strip on screen and the usable area of its monitor
+/// (taskbar excluded), both in points.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    strip: Rect,
+    screen: Option<Rect>,
 }
 
-/// Shows `lines` below the strip (or above it, near the bottom of the screen), aligned to `x`.
+impl Anchor {
+    fn of(ctx: &egui::Context, window: Option<Window>) -> Self {
+        let (outer, scale) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().native_pixels_per_point));
+        let strip = outer.unwrap_or(Rect::from_min_size(Pos2::ZERO, Vec2::new(0.0, STRIP_HEIGHT)));
+        let scale = scale.unwrap_or(1.0);
+        let screen = window.and_then(Window::work_area).map(|[left, top, right, bottom]| {
+            Rect::from_min_max(Pos2::new(left as f32, top as f32), Pos2::new(right as f32, bottom as f32)) / scale
+        });
+        Self { strip, screen }
+    }
+
+    /// Top-left of a popup of `size` aligned to `x` (relative to the strip's left edge): below the
+    /// strip, or above it when it doesn't fit below, then slid back onto the screen if it would
+    /// still stick out at any edge.
+    fn popup_position(self, x: f32, size: Vec2) -> Pos2 {
+        let below = self.strip.bottom() + POPUP_GAP;
+        let above = self.strip.top() - POPUP_GAP - size.y;
+        let mut position = Pos2::new(self.strip.left() + x, below);
+        if let Some(screen) = self.screen {
+            if below + size.y > screen.bottom() && above >= screen.top() {
+                position.y = above;
+            }
+            // `min` before `max`, so a popup larger than the screen keeps its top-left corner visible.
+            position.x = position.x.min(screen.right() - size.x).max(screen.left());
+            position.y = position.y.min(screen.bottom() - size.y).max(screen.top());
+        }
+        position
+    }
+}
+
+/// Shows `lines` next to the strip, aligned to `x` and kept on screen.
 /// `history` (0–100 values, oldest first) is drawn as a graph under the text.
-fn show_details(
-    ctx: &egui::Context,
-    strip_origin: Pos2,
-    x: f32,
-    monitor_height: Option<f32>,
-    lines: Vec<Arc<Galley>>,
-    history: Option<Vec<f32>>,
-) {
+fn show_details(ctx: &egui::Context, anchor: Anchor, x: f32, lines: Vec<Arc<Galley>>, history: Option<Vec<f32>>) {
     let text_width = lines.iter().map(|g| g.size().x).fold(0.0, f32::max);
     let text_height: f32 = lines.iter().map(|g| g.size().y).sum();
     let width = if history.is_some() { text_width.max(GRAPH_MIN_WIDTH) } else { text_width };
     let height = text_height + if history.is_some() { DETAIL_PADDING + GRAPH_HEIGHT } else { 0.0 };
     let size = Vec2::new(width, height) + Vec2::splat(2.0 * DETAIL_PADDING);
 
-    let y = popup_y(strip_origin.y, size.y, monitor_height);
-    let builder = popup_builder("Compteur details", Pos2::new(strip_origin.x + x, y), size.ceil())
+    let size = size.ceil();
+    let builder = popup_builder("Compteur details", anchor.popup_position(x, size), size)
         .with_active(false)
         .with_mouse_passthrough(true);
 
@@ -661,4 +700,50 @@ fn draw_graph(painter: &egui::Painter, rect: Rect, values: &[f32]) {
         })
         .collect();
     painter.add(egui::Shape::line(points, Stroke::new(1.5, GRAPH_COLOR)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCREEN: Rect = Rect { min: Pos2::new(0.0, 0.0), max: Pos2::new(1000.0, 800.0) };
+    const MENU: Vec2 = Vec2::new(200.0, 300.0);
+
+    fn anchor_at(left: f32, top: f32) -> Anchor {
+        Anchor {
+            strip: Rect::from_min_size(Pos2::new(left, top), Vec2::new(400.0, STRIP_HEIGHT)),
+            screen: Some(SCREEN),
+        }
+    }
+
+    #[test]
+    fn popup_goes_below_the_strip_when_it_fits() {
+        assert_eq!(
+            anchor_at(100.0, 50.0).popup_position(30.0, MENU),
+            Pos2::new(130.0, 50.0 + STRIP_HEIGHT + POPUP_GAP)
+        );
+    }
+
+    #[test]
+    fn popup_goes_above_a_strip_near_the_bottom() {
+        let top = 760.0;
+        assert_eq!(anchor_at(100.0, top).popup_position(0.0, MENU).y, top - POPUP_GAP - MENU.y);
+    }
+
+    #[test]
+    fn popup_slides_left_at_the_right_edge() {
+        assert_eq!(anchor_at(700.0, 50.0).popup_position(250.0, MENU).x, SCREEN.right() - MENU.x);
+    }
+
+    #[test]
+    fn popup_taller_than_both_sides_stays_on_screen() {
+        let position = anchor_at(0.0, 300.0).popup_position(0.0, Vec2::new(200.0, 600.0));
+        assert!(position.y >= 0.0 && position.y + 600.0 <= SCREEN.bottom());
+    }
+
+    #[test]
+    fn popup_without_screen_info_goes_below() {
+        let anchor = Anchor { screen: None, ..anchor_at(10.0, 790.0) };
+        assert_eq!(anchor.popup_position(0.0, MENU), Pos2::new(10.0, 790.0 + STRIP_HEIGHT + POPUP_GAP));
+    }
 }

@@ -12,9 +12,7 @@ use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-use crate::{icon::icon_rgba, platform, platform::Window};
-
-const TRAY_ICON_SIZE: u32 = 32;
+use crate::{icon::RESOURCE_ID, platform, platform::Window};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -54,7 +52,8 @@ impl Controls {
         ])
         .ok()?;
 
-        let icon = Icon::from_rgba(icon_rgba(TRAY_ICON_SIZE), TRAY_ICON_SIZE, TRAY_ICON_SIZE).ok()?;
+        // From the exe's embedded icon, so Windows picks the size that suits the tray's DPI.
+        let icon = Icon::from_resource(RESOURCE_ID, None).ok()?;
         let tray = TrayIconBuilder::new()
             .with_icon(icon)
             .with_tooltip("Compteur")

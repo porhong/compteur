@@ -6,7 +6,11 @@ A small always-on-top strip that shows how your Windows PC is doing:
 CPU 23% │ RAM 61% │ GPU 10% 50° │ VRAM 13% │ NET ↓8.3K ↑6.1K │ DSK R 0B W4.0K │ TOP chrome 12%
 ```
 
-Values turn amber at 70 % (75 °C) and red at 90 % (90 °C). Hover a segment for details and a 60-second graph.
+Values turn amber at 70 % (75 °C) and red at 90 % (90 °C), label included. Hover a segment for details and a 60-second graph.
+
+## Download
+
+Get `compteur.exe` from the [latest release](https://github.com/porhong/compteur/releases/latest). It is a single file: put it anywhere and run it. Right-click the strip → "Start with Windows" to launch it at sign-in.
 
 ## Using it
 
@@ -52,6 +56,17 @@ cargo clippy --all-targets -- -D warnings
 
 `.cargo/config.toml` links the C runtime statically, so the exe runs on PCs without llvm-mingw.
 
+### Releasing
+
+Bump `version` in `Cargo.toml`, commit, then tag and push:
+
+```
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow checks that the tag matches `Cargo.toml`, runs the tests and clippy, builds on GitHub's Windows runner (MSVC toolchain, static C runtime) and attaches `compteur.exe` plus its SHA-256 to the release.
+
 ## Code map
 
 | File | Role |
@@ -63,4 +78,6 @@ cargo clippy --all-targets -- -D warnings
 | `src/pdh.rs` | Safe wrapper over Windows performance counters |
 | `src/platform.rs` | Win32 bits egui doesn't expose: Alt-Tab hiding, topmost, shadows, autostart |
 | `src/controls.rs` | Tray icon and global hotkeys |
-| `src/icon.rs`, `build.rs` | App icon drawn in code and embedded in the exe |
+| `src/icon.rs`, `build.rs` | Window icon; embeds `assets/compteur.ico` in the exe (also used by the tray) |
+| `tools/make_icon.py` | Regenerates `assets/` from `logo.jfif` (`python tools/make_icon.py logo.jfif assets`, needs Pillow and NumPy) |
+| `.github/workflows/release.yml` | Pushing a `v*` tag tests, builds and publishes a GitHub release |

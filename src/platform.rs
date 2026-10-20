@@ -10,6 +10,7 @@ use windows::{
             DWMNCRP_DISABLED, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY, DwmGetWindowAttribute,
             DwmSetWindowAttribute,
         },
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
         System::{
             Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW},
             Threading::{CreateMutexW, GetCurrentThreadId},
@@ -64,6 +65,16 @@ impl Window {
     pub fn set_visible(self, visible: bool) {
         // SAFETY: valid window handle; the return value is the previous state, not an error.
         let _ = unsafe { ShowWindow(self.hwnd(), if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
+    }
+
+    /// The usable area (taskbar excluded) of the monitor the window is on, in physical pixels as
+    /// `[left, top, right, bottom]`.
+    pub fn work_area(self) -> Option<[i32; 4]> {
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        // SAFETY: `info` is a valid MONITORINFO with `cbSize` set, alive for the call.
+        let found = unsafe { GetMonitorInfoW(MonitorFromWindow(self.hwnd(), MONITOR_DEFAULTTONEAREST), &mut info) };
+        let work = info.rcWork;
+        found.as_bool().then_some([work.left, work.top, work.right, work.bottom])
     }
 
     /// Moves the strip back to the top of the always-on-top band, where other topmost windows
