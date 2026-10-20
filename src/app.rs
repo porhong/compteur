@@ -10,6 +10,8 @@ use eframe::egui::{
 };
 
 use crate::{
+    cleanup::{Category, Choices, Cleaner, Task},
+    cleanup_ui::{CleanupWindow, SCAN_MAX_AGE},
     config::{Config, Metric, Shown},
     controls::{Action, Controls},
     platform::{self, Window},
@@ -27,7 +29,7 @@ const DETAILS_FADE_SECS: f32 = 0.12;
 /// Time constant of the details popup's glide between segments.
 const DETAILS_GLIDE_SECS: f32 = 0.05;
 /// Popups have no OS shadow (see `platform::remove_window_frames`), so a faint edge separates them.
-const POPUP_BORDER: Stroke = Stroke { width: 1.0, color: Color32::from_gray(70) };
+pub const POPUP_BORDER: Stroke = Stroke { width: 1.0, color: Color32::from_gray(70) };
 const GRAPH_HEIGHT: f32 = 36.0;
 const GRAPH_MIN_WIDTH: f32 = 180.0;
 /// Teal, matching the app icon.
@@ -47,6 +49,10 @@ const REFRESH_CHOICES: [(u64, &str); 3] = [(500, "0.5 s"), (1000, "1 s"), (2000,
 const TOPMOST_INTERVAL: Duration = Duration::from_secs(5);
 /// Characters of the busiest app's name shown on the strip.
 const TOP_NAME_WIDTH: usize = 10;
+/// Width and height of the cleanup button's icon at the end of the strip.
+const CLEAN_ICON_SIZE: f32 = 14.0;
+/// How long the result of a clean stays on screen.
+const TOAST_DURATION: Duration = Duration::from_secs(4);
 
 pub struct App {
     config: Config,
@@ -63,6 +69,18 @@ pub struct App {
     applied: Option<(bool, bool)>,
     raised_at: Instant,
     details: Option<Details>,
+    cleaner: Cleaner,
+    cleanup_window: Option<CleanupWindow>,
+    /// Number of cleans whose result has been shown, to spot a new one.
+    cleans_shown: u64,
+    /// While set, the latest clean's result shows under the strip.
+    toast_until: Option<Instant>,
+}
+
+/// What the settings menu asked for, besides the settings it changes directly.
+enum MenuChoice {
+    OpenCleanup,
+    Exit,
 }
 
 struct MenuState {
@@ -103,12 +121,21 @@ impl App {
             applied: None,
             raised_at: Instant::now(),
             details: None,
+            cleaner: Cleaner::new(cc.egui_ctx.clone()),
+            cleanup_window: None,
+            cleans_shown: 0,
+            toast_until: None,
         }
     }
 
     /// Opens the settings menu `x` points from the strip's left edge.
     fn open_menu(&mut self, anchor: Anchor, x: f32) {
         self.menu = Some(MenuState { anchor, x, size: MENU_SIZE, was_focused: false });
+    }
+
+    fn open_cleanup(&mut self, anchor: Anchor, x: f32) {
+        self.menu = None;
+        self.cleanup_window = Some(CleanupWindow::new(anchor, x, &self.cleaner));
     }
 
     /// Applies tray-menu and hotkey actions. Showing/hiding and autostart were already done by the
@@ -120,6 +147,7 @@ impl App {
                 Action::ToggleVisible => {}
                 Action::ToggleClickThrough => self.config.click_through = !self.config.click_through,
                 Action::OpenSettings => self.open_menu(Anchor::of(ctx, self.window), 0.0),
+                Action::OpenCleanup => self.open_cleanup(Anchor::of(ctx, self.window), 0.0),
                 Action::ToggleAutostart => self.autostart = platform::autostart_enabled(),
                 Action::Exit => {
                     self.save_now();
@@ -184,7 +212,7 @@ impl App {
     fn show_menu(&mut self, ctx: &egui::Context) {
         let Some(menu) = &mut self.menu else { return };
         let mut close = false;
-        let mut exit = false;
+        let mut choice = None;
 
         let config = &mut self.config;
         let mut autostart = self.autostart;
@@ -199,7 +227,7 @@ impl App {
                 close = true;
             }
             let panel = egui::CentralPanel::default().show(ui, |ui| {
-                exit = menu_contents(ui, config, &mut autostart);
+                choice = menu_contents(ui, config, &mut autostart);
                 ui.min_rect().size()
             });
             ui.painter().rect_stroke(ui.max_rect(), CornerRadius::ZERO, POPUP_BORDER, StrokeKind::Inside);
@@ -219,12 +247,26 @@ impl App {
             }
             self.autostart = platform::autostart_enabled();
         }
-        if exit {
-            self.save_now();
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+        match choice {
+            Some(MenuChoice::Exit) => {
+                self.save_now();
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                self.menu = None;
+            }
+            Some(MenuChoice::OpenCleanup) => {
+                let (anchor, x) = (menu.anchor, menu.x);
+                self.open_cleanup(anchor, x);
+            }
+            None if close => self.menu = None,
+            None => {}
         }
-        if close || exit {
-            self.menu = None;
+    }
+
+    fn show_cleanup(&mut self, ctx: &egui::Context) {
+        if let Some(window) = &mut self.cleanup_window
+            && !window.show(ctx, &self.cleaner, &mut self.config.cleanup)
+        {
+            self.cleanup_window = None;
         }
     }
 }
@@ -247,8 +289,10 @@ impl eframe::App for App {
             .collect();
         let separator = ui.painter().layout_no_wrap(SEPARATOR.to_owned(), FontId::monospace(FONT_SIZE), LABEL_COLOR);
 
+        let show_button = self.config.show_clean_button;
         let content_width = segments.iter().map(|(_, galley)| galley.size().x).sum::<f32>()
-            + separator.size().x * segments.len().saturating_sub(1) as f32;
+            + separator.size().x * segments.len().saturating_sub(1) as f32
+            + if show_button { separator.size().x + CLEAN_ICON_SIZE } else { 0.0 };
         let size = Vec2::new((content_width + 2.0 * PADDING_X).ceil(), STRIP_HEIGHT);
         Self::fit_window(&ctx, size);
 
@@ -270,20 +314,29 @@ impl eframe::App for App {
             spans.push((metric, x..x + width));
             x += width;
         }
+        let button_rect = show_button.then(|| {
+            let y = rect.center().y - separator.size().y / 2.0;
+            ui.painter().galley(Pos2::new(x, y), separator.clone(), LABEL_COLOR);
+            let left = x + separator.size().x;
+            Rect::from_center_size(Pos2::new(left + CLEAN_ICON_SIZE / 2.0, rect.center().y), Vec2::splat(CLEAN_ICON_SIZE))
+        });
 
         let response = ui.interact(rect, Id::unique("strip"), Sense::click_and_drag());
+        // Click-only, so a drag that starts on the button still moves the strip.
+        let button = button_rect.map(|r| ui.interact(r.expand(3.0), Id::unique("clean-button"), Sense::click()));
         if response.drag_started_by(PointerButton::Primary) && !self.config.locked {
             ctx.send_viewport_cmd(ViewportCommand::StartDrag);
         }
         let menu_click = response.secondary_clicked().then(|| response.interact_pointer_pos().map_or(0.0, |p| p.x));
+        let popups_allowed = self.menu.is_none() && menu_click.is_none() && !response.dragged();
 
         // Details for the hovered segment, unless the menu or a drag is in progress.
         let hovered = response
             .hover_pos()
-            .filter(|_| self.menu.is_none() && menu_click.is_none() && !response.dragged())
+            .filter(|_| popups_allowed)
             .and_then(|pos| spans.iter().find(|(_, span)| span.contains(&pos.x)))
             .map(|(metric, span)| (*metric, (span.start + span.end) / 2.0));
-        let details = hovered.map(|(metric, x)| {
+        let mut popup = hovered.map(|(metric, x)| {
             (x, detail_lines(metric, &shared, self.config.refresh_ms), detail_history(metric, &shared))
         });
         drop(shared);
@@ -292,7 +345,51 @@ impl eframe::App for App {
             self.open_menu(Anchor::of(&ctx, self.window), x);
         }
 
-        if let Some((x, lines, history)) = details {
+        // The cleanup button: one click cleans with the saved choices; the result shows as a toast.
+        if let Some((seq, _)) = self.cleaner.report()
+            && seq > self.cleans_shown
+        {
+            self.cleans_shown = seq;
+            self.toast_until = Some(Instant::now() + TOAST_DURATION);
+        }
+        let toast_on = self.toast_until.is_some_and(|until| Instant::now() < until);
+        match self.toast_until {
+            Some(until) if toast_on => ctx.request_repaint_after(until - Instant::now()),
+            _ => self.toast_until = None,
+        }
+        if let (Some(button), Some(button_rect)) = (&button, button_rect) {
+            if button.clicked() {
+                self.cleaner.clean(self.config.cleanup);
+            }
+            let busy = self.cleaner.busy();
+            let color = if busy.is_some() || button.hovered() {
+                TEXT_COLOR
+            } else if toast_on {
+                GRAPH_COLOR
+            } else {
+                LABEL_COLOR
+            };
+            if busy == Some(Task::Cleaning) {
+                draw_spinner(ui.painter(), button_rect, color, ctx.input(|i| i.time));
+                ctx.request_repaint();
+            } else {
+                draw_broom(ui.painter(), button_rect, color);
+            }
+            if button.hovered() && popups_allowed {
+                self.cleaner.scan_if_older(SCAN_MAX_AGE);
+                let center = button_rect.center().x - rect.left();
+                popup = Some((center, clean_button_lines(&self.cleaner, self.config.cleanup), None));
+            }
+        }
+        if popup.is_none() && toast_on && self.cleanup_window.is_none() {
+            let center = button_rect.map_or(rect.width() / 2.0, |r| r.center().x - rect.left());
+            let mut lines = vec!["Clean-up done".to_owned()];
+            lines.extend(self.cleaner.report().map(|(_, report)| report.lines()).unwrap_or_default());
+            popup = Some((center, lines, None));
+        }
+        let popup_shown = popup.is_some();
+
+        if let Some((x, lines, history)) = popup {
             let galleys: Vec<_> = lines
                 .into_iter()
                 .map(|line| ui.painter().layout_no_wrap(line, FontId::monospace(DETAIL_FONT_SIZE), TEXT_COLOR))
@@ -305,10 +402,10 @@ impl eframe::App for App {
         }
         if let Some(details) = &mut self.details {
             let dt = ctx.input(|i| i.stable_dt).min(0.1);
-            if details.animate(hovered.is_some(), dt) {
+            if details.animate(popup_shown, dt) {
                 ctx.request_repaint();
             }
-            if details.opacity == 0.0 && hovered.is_none() {
+            if details.opacity == 0.0 && !popup_shown {
                 self.details = None; // faded out
             }
         }
@@ -316,13 +413,14 @@ impl eframe::App for App {
             show_details(&ctx, details);
         }
         self.show_menu(&ctx);
+        self.show_cleanup(&ctx);
         // After the popups above, so a window opened this frame never shows the shadow.
         platform::remove_window_frames();
     }
 }
 
-/// Settings menu. Changes apply immediately; returns true when Exit was clicked.
-fn menu_contents(ui: &mut egui::Ui, config: &mut Config, autostart: &mut bool) -> bool {
+/// Settings menu. Changes apply immediately; returns what else was clicked.
+fn menu_contents(ui: &mut egui::Ui, config: &mut Config, autostart: &mut bool) -> Option<MenuChoice> {
     ui.label(egui::RichText::new("Show on strip").strong());
     let shown_count = config.shown.count();
     for metric in Metric::ALL {
@@ -349,9 +447,64 @@ fn menu_contents(ui: &mut egui::Ui, config: &mut Config, autostart: &mut bool) -
     ui.checkbox(&mut config.click_through, "Click-through (Ctrl+Alt+M)")
         .on_hover_text("Clicks go to the window below. Use the tray icon or the hotkey to turn it off.");
     ui.checkbox(autostart, "Start with Windows");
+    ui.checkbox(&mut config.show_clean_button, "Clean-up button on strip");
 
     ui.separator();
-    ui.button("Exit Compteur").clicked()
+    let mut choice = None;
+    if ui.button("Clean up PC…").clicked() {
+        choice = Some(MenuChoice::OpenCleanup);
+    }
+    if ui.button("Exit Compteur").clicked() {
+        choice = Some(MenuChoice::Exit);
+    }
+    choice
+}
+
+/// What a click on the cleanup button will do, with the latest sizes and result.
+fn clean_button_lines(cleaner: &Cleaner, choices: Choices) -> Vec<String> {
+    let scan = cleaner.scan();
+    let mut lines = vec!["Click to clean up:".to_owned()];
+    for category in Category::ALL.into_iter().filter(|c| choices.get(*c)) {
+        let outcome = scan.as_ref().and_then(|scan| scan.get(category));
+        let size = outcome.map(|outcome| match category {
+            Category::Memory => format!("{} in use", format::bytes(outcome.bytes)),
+            _ => format::bytes(outcome.bytes),
+        });
+        lines.push(format!("  {:<30} {}", category.label(), size.unwrap_or_else(|| "…".to_owned())));
+        lines.extend(outcome.into_iter().flat_map(|o| &o.notes).map(|note| format!("    {note}")));
+    }
+    if !choices.any() {
+        lines.push("  Nothing selected".to_owned());
+    }
+    match cleaner.busy() {
+        Some(Task::Cleaning) => lines.push("Cleaning…".to_owned()),
+        Some(Task::Scanning) => lines.push("Measuring…".to_owned()),
+        None => {}
+    }
+    if let Some((_, report)) = cleaner.report() {
+        lines.push("Last clean:".to_owned());
+        lines.extend(report.lines().into_iter().map(|line| format!("  {line}")));
+    }
+    lines.push("Right-click the strip → Clean up PC… to choose".to_owned());
+    lines
+}
+
+/// A small broom, handle at the top right; drawn because the default fonts have no such icon.
+fn draw_broom(painter: &egui::Painter, rect: Rect, color: Color32) {
+    // Coordinates on a 16-unit grid, scaled to `rect`.
+    let at = |x: f32, y: f32| rect.min + Vec2::new(x, y) * (rect.width() / 16.0);
+    painter.line_segment([at(14.5, 1.5), at(8.5, 7.5)], Stroke::new(1.5, color));
+    let head = vec![at(7.6, 6.6), at(9.4, 8.4), at(6.4, 14.0), at(2.0, 9.6)];
+    painter.add(egui::Shape::convex_polygon(head, color, Stroke::NONE));
+}
+
+/// A rotating arc, shown while a clean runs.
+fn draw_spinner(painter: &egui::Painter, rect: Rect, color: Color32, time: f64) {
+    let start = (time * 6.0) as f32;
+    let points: Vec<Pos2> = (0..=24)
+        .map(|i| rect.center() + Vec2::angled(start + i as f32 / 24.0 * 4.5) * rect.width() * 0.4)
+        .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.5, color)));
 }
 
 fn level_color(level: Level) -> Color32 {
@@ -634,7 +787,7 @@ fn detail_lines(metric: Metric, shared: &Shared, refresh_ms: u64) -> Vec<String>
 }
 
 /// The strip is too small to host egui popups, so menus and details are their own borderless windows.
-fn popup_builder(title: &str, position: Pos2, size: Vec2) -> ViewportBuilder {
+pub fn popup_builder(title: &str, position: Pos2, size: Vec2) -> ViewportBuilder {
     ViewportBuilder::default()
         .with_title(title)
         .with_position(position)
@@ -648,13 +801,13 @@ fn popup_builder(title: &str, position: Pos2, size: Vec2) -> ViewportBuilder {
 /// What popups are placed against: the strip on screen and the usable area of its monitor
 /// (taskbar excluded), both in points.
 #[derive(Debug, Clone, Copy)]
-struct Anchor {
+pub struct Anchor {
     strip: Rect,
     screen: Option<Rect>,
 }
 
 impl Anchor {
-    fn of(ctx: &egui::Context, window: Option<Window>) -> Self {
+    pub fn of(ctx: &egui::Context, window: Option<Window>) -> Self {
         let (outer, scale) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().native_pixels_per_point));
         let strip = outer.unwrap_or(Rect::from_min_size(Pos2::ZERO, Vec2::new(0.0, STRIP_HEIGHT)));
         let scale = scale.unwrap_or(1.0);
@@ -667,7 +820,7 @@ impl Anchor {
     /// Top-left of a popup of `size` aligned to `x` (relative to the strip's left edge): below the
     /// strip, or above it when it doesn't fit below, then slid back onto the screen if it would
     /// still stick out at any edge.
-    fn popup_position(self, x: f32, size: Vec2) -> Pos2 {
+    pub fn popup_position(self, x: f32, size: Vec2) -> Pos2 {
         let below = self.strip.bottom() + POPUP_GAP;
         let above = self.strip.top() - POPUP_GAP - size.y;
         let mut position = Pos2::new(self.strip.left() + x, below);

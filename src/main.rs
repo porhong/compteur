@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cleanup;
+mod cleanup_ui;
 mod config;
 mod controls;
 mod format;

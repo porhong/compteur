@@ -41,6 +41,21 @@ Settings are saved to `%APPDATA%\compteur\config\config.toml`.
 - **Exclusive-fullscreen games** draw over every window, including this one. Borderless/windowed games are fine.
 - Hidden metrics are not sampled at all, so turning off GPU (the most expensive counters) lowers CPU use further.
 
+## Clean up PC
+
+Click the broom at the end of the strip to clean up with one click; hover it first to see what will be freed. Right-click the strip → **Clean up PC…** (or the tray menu) to choose what is cleaned and see sizes before cleaning.
+
+| Choice | What it removes | Default |
+|---|---|---|
+| Temporary files | Files in `%TEMP%` older than a day (newer ones may still be in use) | on |
+| Error reports and crash dumps | Windows Error Reporting files and app crash dumps | on |
+| Browser caches | Cached web files of Chrome, Edge, Brave, Vivaldi, Firefox, only for browsers that are closed. Never history, cookies or logins | on |
+| Graphics shader caches | DirectX/GPU driver caches; rebuilt automatically, games may stutter once | off |
+| Recycle Bin | Your deleted files; can't be undone | off |
+| Memory of background apps | Moves memory of apps with no window on screen out of RAM; Windows brings it back when needed, so such an app may pause briefly. Apps you can see are never touched | on |
+
+Files that are in use or protected are skipped, links are never followed, and nothing needs admin rights. For Windows Update leftovers and other system files, the window links to Windows' own Disk Cleanup.
+
 ## Disk use
 
 Compteur stores one small settings file, `%APPDATA%\compteur\config\config.toml`, and nothing else: no logs or caches. To remove every trace, turn off "Start with Windows", exit, and delete that folder.

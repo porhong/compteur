@@ -1,27 +1,36 @@
 //! Thin wrappers over the Win32 calls the strip needs beyond what egui/winit expose.
 
-use std::io;
+use std::{collections::HashSet, io};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
     Win32::{
         Foundation::{
-            ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
+            WPARAM,
         },
         Graphics::Dwm::{
-            DWMNCRP_DISABLED, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY, DwmGetWindowAttribute,
-            DwmSetWindowAttribute,
+            DWMNCRP_DISABLED, DWMWA_CLOAKED, DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY,
+            DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
         System::{
             Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW},
-            Threading::{CreateMutexW, GetCurrentThreadId},
+            ProcessStatus::K32EmptyWorkingSet,
+            SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+            Threading::{
+                CreateMutexW, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+            },
         },
         UI::{
-            Shell::{DefSubclassProc, SetWindowSubclass},
+            Shell::{
+                DefSubclassProc, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW,
+                SHQUERYRBINFO, SHQueryRecycleBinW, SetWindowSubclass, ShellExecuteW,
+            },
             WindowsAndMessaging::{
-                EnumThreadWindows, GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, IsWindowVisible, SW_HIDE,
-                SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+                EnumThreadWindows, EnumWindows, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW,
+                GetWindowThreadProcessId, HWND_TOPMOST, IsIconic, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE,
+                SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
                 SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_NCCALCSIZE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
             },
         },
@@ -199,4 +208,81 @@ pub fn set_autostart(enabled: bool) -> io::Result<()> {
         }
     };
     if status == ERROR_SUCCESS { Ok(()) } else { Err(io::Error::from_raw_os_error(status.0 as i32)) }
+}
+
+/// Processes the user is looking at: the foreground app and every app with a visible window that
+/// isn't minimized or cloaked (on another virtual desktop). The cleanup leaves these alone.
+pub fn on_screen_process_ids() -> HashSet<u32> {
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` is the `HashSet` passed below, alive for the whole enumeration.
+        let ids = unsafe { &mut *(lparam.0 as *mut HashSet<u32>) };
+        let mut cloaked = 0u32;
+        // SAFETY: read-only queries on a window handle supplied by EnumWindows; `cloaked` is a
+        // valid u32 out-buffer for DWMWA_CLOAKED.
+        unsafe {
+            let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&raw mut cloaked).cast(), size_of::<u32>() as u32);
+            if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() && cloaked == 0 {
+                let mut pid = 0;
+                GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
+                ids.insert(pid);
+            }
+        }
+        BOOL::from(true) // keep enumerating
+    }
+
+    let mut ids = HashSet::new();
+    // SAFETY: the callback only touches `ids` through `lparam` during this call.
+    unsafe {
+        let _ = EnumWindows(Some(visit), LPARAM(&raw mut ids as isize));
+        let mut pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&raw mut pid));
+        ids.insert(pid);
+    }
+    ids.remove(&0);
+    ids
+}
+
+/// Asks Windows to move a process's memory out of RAM (it comes back on demand). False when the
+/// process can't be opened, such as system or elevated processes.
+pub fn trim_working_set(pid: u32) -> bool {
+    // SAFETY: the handle is checked, used for one call and closed.
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let trimmed = K32EmptyWorkingSet(process).as_bool();
+        let _ = CloseHandle(process);
+        trimmed
+    }
+}
+
+/// Physical memory in use (total minus available), in bytes.
+pub fn memory_in_use() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    // SAFETY: `status` is a valid MEMORYSTATUSEX with `dwLength` set.
+    unsafe { GlobalMemoryStatusEx(&mut status) }.ok()?;
+    Some(status.ullTotalPhys.saturating_sub(status.ullAvailPhys))
+}
+
+/// Size in bytes and item count of the Recycle Bins on all drives.
+pub fn recycle_bin_size() -> Option<(u64, u64)> {
+    let mut info = SHQUERYRBINFO { cbSize: size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };
+    // SAFETY: a null root path means all drives; `info` is valid with `cbSize` set.
+    unsafe { SHQueryRecycleBinW(PCWSTR::null(), &mut info) }.ok()?;
+    Some((info.i64Size.max(0) as u64, info.i64NumItems.max(0) as u64))
+}
+
+/// Empties the Recycle Bins on all drives, without a confirmation, progress window or sound.
+pub fn empty_recycle_bin() -> bool {
+    // SAFETY: a null root path means all drives; no buffers are passed.
+    unsafe {
+        SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)
+    }
+    .is_ok()
+}
+
+/// Opens Windows' own Disk Cleanup, which can elevate itself to clean system files.
+pub fn open_disk_cleanup() {
+    // SAFETY: constant, NUL-terminated strings; the result only reports whether it launched.
+    let _ = unsafe { ShellExecuteW(None, w!("open"), w!("cleanmgr.exe"), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
 }

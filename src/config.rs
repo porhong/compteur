@@ -5,6 +5,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::cleanup;
+
 /// A metric that can be shown on the strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
@@ -131,6 +133,10 @@ pub struct Config {
     /// When set, clicks pass through the strip to the window below.
     pub click_through: bool,
     pub shown: Shown,
+    /// Show the one-click cleanup button at the end of the strip.
+    pub show_clean_button: bool,
+    /// What the cleanup removes.
+    pub cleanup: cleanup::Choices,
 }
 
 impl Default for Config {
@@ -142,6 +148,8 @@ impl Default for Config {
             locked: false,
             click_through: false,
             shown: Shown::default(),
+            show_clean_button: true,
+            cleanup: cleanup::Choices::default(),
         }
     }
 }

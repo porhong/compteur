@@ -19,6 +19,7 @@ pub enum Action {
     ToggleVisible,
     ToggleClickThrough,
     OpenSettings,
+    OpenCleanup,
     ToggleAutostart,
     Exit,
 }
@@ -39,6 +40,7 @@ impl Controls {
         let visible_item = MenuItem::new("Show / hide strip\tCtrl+Alt+H", true, None);
         let click_through_item = CheckMenuItem::new("Click-through\tCtrl+Alt+M", true, click_through, None);
         let settings_item = MenuItem::new("Settings…", true, None);
+        let cleanup_item = MenuItem::new("Clean up PC…", true, None);
         let autostart_item = CheckMenuItem::new("Start with Windows", true, autostart, None);
         let exit_item = MenuItem::new("Exit", true, None);
         let menu = Menu::new();
@@ -46,6 +48,7 @@ impl Controls {
             &visible_item,
             &click_through_item,
             &settings_item,
+            &cleanup_item,
             &autostart_item,
             &PredefinedMenuItem::separator(),
             &exit_item,
@@ -67,7 +70,8 @@ impl Controls {
             // A hidden egui window gets no frames, so anything that can't wait for one happens right here.
             match action {
                 Action::ToggleVisible => window.set_visible(!window.is_visible()),
-                Action::OpenSettings | Action::Exit => window.set_visible(true),
+                // Popups are drawn by the strip, so it must be visible to show them.
+                Action::OpenSettings | Action::OpenCleanup | Action::Exit => window.set_visible(true),
                 Action::ToggleAutostart => {
                     if let Err(err) = platform::set_autostart(!platform::autostart_enabled()) {
                         eprintln!("compteur: failed to change autostart: {err}");
@@ -83,6 +87,7 @@ impl Controls {
             (visible_item.id().clone(), Action::ToggleVisible),
             (click_through_item.id().clone(), Action::ToggleClickThrough),
             (settings_item.id().clone(), Action::OpenSettings),
+            (cleanup_item.id().clone(), Action::OpenCleanup),
             (autostart_item.id().clone(), Action::ToggleAutostart),
             (exit_item.id().clone(), Action::Exit),
         ];
