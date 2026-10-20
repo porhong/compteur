@@ -116,6 +116,66 @@ impl Shown {
     }
 }
 
+/// A place on the strip. CPU load and temperature share one, as do GPU load and temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Slot {
+    Cpu,
+    Memory,
+    Gpu,
+    Vram,
+    Network,
+    Disk,
+    SystemDrive,
+    TopProcess,
+    CleanButton,
+    /// A name this version doesn't know (from a newer config); dropped when the config loads.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Slot {
+    /// Left to right.
+    pub const DEFAULT_ORDER: [Self; 9] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::Gpu,
+        Self::Vram,
+        Self::Network,
+        Self::Disk,
+        Self::SystemDrive,
+        Self::TopProcess,
+        Self::CleanButton,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Memory => "RAM",
+            Self::Gpu => "GPU",
+            Self::Vram => "VRAM",
+            Self::Network => "Network",
+            Self::Disk => "Disk activity",
+            Self::SystemDrive => "Drive C:",
+            Self::TopProcess => "Top app",
+            Self::CleanButton => "Clean-up button",
+            Self::Unknown => "?",
+        }
+    }
+}
+
+/// Keeps each known slot once, in the given order, and appends any that are missing (such as
+/// ones added by a newer version), so the order always covers every slot.
+fn normalize_order(order: &[Slot]) -> Vec<Slot> {
+    let mut normalized: Vec<Slot> = Vec::with_capacity(Slot::DEFAULT_ORDER.len());
+    for slot in order.iter().chain(&Slot::DEFAULT_ORDER) {
+        if *slot != Slot::Unknown && !normalized.contains(slot) {
+            normalized.push(*slot);
+        }
+    }
+    normalized
+}
+
 /// User settings, persisted as TOML in `%APPDATA%\compteur\config\config.toml`.
 ///
 /// `#[serde(default)]` lets older or hand-edited files load: missing keys fall back to defaults.
@@ -135,6 +195,8 @@ pub struct Config {
     pub shown: Shown,
     /// Show the one-click cleanup button at the end of the strip.
     pub show_clean_button: bool,
+    /// Left-to-right order of the strip's segments and the cleanup button.
+    pub order: Vec<Slot>,
     /// What the cleanup removes.
     pub cleanup: cleanup::Choices,
 }
@@ -149,6 +211,7 @@ impl Default for Config {
             click_through: false,
             shown: Shown::default(),
             show_clean_button: true,
+            order: Slot::DEFAULT_ORDER.to_vec(),
             cleanup: cleanup::Choices::default(),
         }
     }
@@ -180,7 +243,25 @@ impl Config {
         if config.shown.count() == 0 {
             config.shown = Shown::default(); // an empty strip would be invisible and unclickable
         }
+        config.order = normalize_order(&config.order);
         config
+    }
+
+    /// Whether `slot` currently has anything on the strip.
+    pub fn slot_shown(&self, slot: Slot) -> bool {
+        let shown = self.shown;
+        match slot {
+            Slot::Cpu => shown.cpu || shown.cpu_temp,
+            Slot::Memory => shown.memory,
+            Slot::Gpu => shown.gpu || shown.gpu_temp,
+            Slot::Vram => shown.vram,
+            Slot::Network => shown.network,
+            Slot::Disk => shown.disk,
+            Slot::SystemDrive => shown.system_drive,
+            Slot::TopProcess => shown.top_process,
+            Slot::CleanButton => self.show_clean_button,
+            Slot::Unknown => false,
+        }
     }
 
     /// Writes to a temp file then renames it, so a crash never leaves a half-written config.
@@ -232,6 +313,19 @@ mod tests {
         let config = Config { shown, ..Config::default() };
         let text = toml::to_string_pretty(&config).unwrap();
         assert_eq!(Config::from_toml(&text).shown, Shown::default());
+    }
+
+    #[test]
+    fn order_round_trips_and_is_repaired() {
+        let mut config = Config::default();
+        config.order.swap(0, 8); // cleanup button first, CPU last
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(Config::from_toml(&text).order, config.order);
+
+        // Duplicates and unknown names are dropped; missing slots are appended in default order.
+        let repaired = Config::from_toml(r#"order = ["clean_button", "gpu", "gpu", "from_the_future"]"#).order;
+        assert_eq!(&repaired[..3], [Slot::CleanButton, Slot::Gpu, Slot::Cpu]);
+        assert_eq!(repaired.len(), Slot::DEFAULT_ORDER.len());
     }
 
     #[test]

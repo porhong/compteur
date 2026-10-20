@@ -12,7 +12,7 @@ use eframe::egui::{
 use crate::{
     cleanup::{Category, Choices, Cleaner, Task},
     cleanup_ui::{CleanupWindow, SCAN_MAX_AGE},
-    config::{Config, Metric, Shown},
+    config::{Config, Metric, Shown, Slot},
     controls::{Action, Controls},
     platform::{self, Window},
     format::{self, Level},
@@ -75,6 +75,21 @@ pub struct App {
     cleans_shown: u64,
     /// While set, the latest clean's result shows under the strip.
     toast_until: Option<Instant>,
+}
+
+/// One thing on the strip, in `Config::order`.
+enum StripItem {
+    Segment(Metric, Arc<Galley>),
+    CleanButton,
+}
+
+impl StripItem {
+    fn width(&self) -> f32 {
+        match self {
+            Self::Segment(_, galley) => galley.size().x,
+            Self::CleanButton => CLEAN_ICON_SIZE,
+        }
+    }
 }
 
 /// What the settings menu asked for, besides the settings it changes directly.
@@ -283,16 +298,20 @@ impl eframe::App for App {
 
         let mut shared = sampler::lock(&self.shared);
         shared.settings = Settings::from_config(&self.config);
-        let segments: Vec<(Metric, Arc<Galley>)> = segments(&shared, self.config.shown)
-            .into_iter()
-            .map(|(metric, job)| (metric, ui.painter().layout_job(job)))
+        let items: Vec<StripItem> = self
+            .config
+            .order
+            .iter()
+            .filter_map(|&slot| match slot {
+                Slot::CleanButton => self.config.show_clean_button.then_some(StripItem::CleanButton),
+                _ => segment(slot, &shared, self.config.shown)
+                    .map(|(metric, job)| StripItem::Segment(metric, ui.painter().layout_job(job))),
+            })
             .collect();
         let separator = ui.painter().layout_no_wrap(SEPARATOR.to_owned(), FontId::monospace(FONT_SIZE), LABEL_COLOR);
 
-        let show_button = self.config.show_clean_button;
-        let content_width = segments.iter().map(|(_, galley)| galley.size().x).sum::<f32>()
-            + separator.size().x * segments.len().saturating_sub(1) as f32
-            + if show_button { separator.size().x + CLEAN_ICON_SIZE } else { 0.0 };
+        let content_width = items.iter().map(StripItem::width).sum::<f32>()
+            + separator.size().x * items.len().saturating_sub(1) as f32;
         let size = Vec2::new((content_width + 2.0 * PADDING_X).ceil(), STRIP_HEIGHT);
         Self::fit_window(&ctx, size);
 
@@ -300,26 +319,30 @@ impl eframe::App for App {
         let background = Color32::from_black_alpha((self.config.opacity * 255.0) as u8);
         ui.painter().rect_filled(rect, CornerRadius::same(CORNER_RADIUS), background);
 
-        // Lay segments out left to right, remembering each one's x-range for hover lookup.
+        // Lay items out left to right, remembering each segment's x-range for hover lookup.
         let mut x = rect.left() + PADDING_X;
-        let mut spans = Vec::with_capacity(segments.len());
-        for (index, (metric, galley)) in segments.into_iter().enumerate() {
+        let mut spans = Vec::with_capacity(items.len());
+        let mut button_rect = None;
+        for (index, item) in items.into_iter().enumerate() {
             if index > 0 {
                 let y = rect.center().y - separator.size().y / 2.0;
                 ui.painter().galley(Pos2::new(x, y), separator.clone(), LABEL_COLOR);
                 x += separator.size().x;
             }
-            let width = galley.size().x;
-            ui.painter().galley(Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley, TEXT_COLOR);
-            spans.push((metric, x..x + width));
+            let width = item.width();
+            match item {
+                StripItem::Segment(metric, galley) => {
+                    let y = rect.center().y - galley.size().y / 2.0;
+                    ui.painter().galley(Pos2::new(x, y), galley, TEXT_COLOR);
+                    spans.push((metric, x..x + width));
+                }
+                StripItem::CleanButton => {
+                    let center = Pos2::new(x + width / 2.0, rect.center().y);
+                    button_rect = Some(Rect::from_center_size(center, Vec2::splat(CLEAN_ICON_SIZE)));
+                }
+            }
             x += width;
         }
-        let button_rect = show_button.then(|| {
-            let y = rect.center().y - separator.size().y / 2.0;
-            ui.painter().galley(Pos2::new(x, y), separator.clone(), LABEL_COLOR);
-            let left = x + separator.size().x;
-            Rect::from_center_size(Pos2::new(left + CLEAN_ICON_SIZE / 2.0, rect.center().y), Vec2::splat(CLEAN_ICON_SIZE))
-        });
 
         let response = ui.interact(rect, Id::unique("strip"), Sense::click_and_drag());
         // Click-only, so a drag that starts on the button still moves the strip.
@@ -431,6 +454,32 @@ fn menu_contents(ui: &mut egui::Ui, config: &mut Config, autostart: &mut bool) -
             config.shown.set(metric, on);
         }
     }
+
+    egui::CollapsingHeader::new("Order on strip").show(ui, |ui| {
+        ui.label(egui::RichText::new("Top of the list is the left end.").small().weak());
+        let mut swap = None;
+        let last = config.order.len().saturating_sub(1);
+        for (index, slot) in config.order.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let arrow = |text| egui::Button::new(egui::RichText::new(text).monospace()).small();
+                if ui.add_enabled(index > 0, arrow("↑")).on_hover_text("Move left").clicked() {
+                    swap = Some((index, index - 1));
+                }
+                if ui.add_enabled(index < last, arrow("↓")).on_hover_text("Move right").clicked() {
+                    swap = Some((index, index + 1));
+                }
+                let label = egui::RichText::new(slot.label());
+                // Hidden slots keep their place but are dimmed.
+                ui.label(if config.slot_shown(*slot) { label } else { label.weak() });
+            });
+        }
+        if let Some((a, b)) = swap {
+            config.order.swap(a, b);
+        }
+        if ui.small_button("Reset order").clicked() {
+            config.order = Slot::DEFAULT_ORDER.to_vec();
+        }
+    });
 
     ui.separator();
     ui.horizontal(|ui| {
@@ -575,76 +624,72 @@ fn fixed_width(text: &str, width: usize) -> String {
 }
 
 /// The visible strip segments, in strip order, each tagged with the metric its hover details describe.
-fn segments(shared: &Shared, shown: Shown) -> Vec<(Metric, LayoutJob)> {
+/// The strip segment for `slot`, tagged with the metric its hover details describe; `None` when
+/// the slot is hidden (or is the cleanup button, which isn't text).
+fn segment(slot: Slot, shared: &Shared, shown: Shown) -> Option<(Metric, LayoutJob)> {
     let snapshot = &shared.snapshot;
     let gpu = snapshot.gpu.as_ref();
-    let mut segments = Vec::new();
-
-    if shown.cpu || shown.cpu_temp {
-        let load = shown.cpu.then(|| snapshot.cpu.as_ref().map(|cpu| cpu.usage));
-        let temp = shown.cpu_temp.then_some(snapshot.cpu_temp);
-        let metric = if shown.cpu { Metric::Cpu } else { Metric::CpuTemp };
-        segments.push((metric, load_and_temp_segment("CPU ", load, temp)));
-    }
-    if shown.memory {
-        segments.push((Metric::Memory, percent_segment("RAM ", snapshot.memory.as_ref().map(|m| m.percent()))));
-    }
-    if shown.gpu || shown.gpu_temp {
-        let load = shown.gpu.then(|| gpu.and_then(|g| g.usage()));
-        let temp = shown.gpu_temp.then(|| gpu.and_then(|g| g.temperature()));
-        let metric = if shown.gpu { Metric::Gpu } else { Metric::GpuTemp };
-        segments.push((metric, load_and_temp_segment("GPU ", load, temp)));
-    }
-    if shown.vram {
-        segments.push((Metric::Vram, percent_segment("VRAM ", gpu.and_then(|g| g.main_adapter()?.vram_percent()))));
-    }
-    if shown.network {
-        let network = snapshot.network.as_ref();
-        segments.push((
-            Metric::Network,
-            segment_job(&[
+    match slot {
+        Slot::Cpu if shown.cpu || shown.cpu_temp => {
+            let load = shown.cpu.then(|| snapshot.cpu.as_ref().map(|cpu| cpu.usage));
+            let temp = shown.cpu_temp.then_some(snapshot.cpu_temp);
+            let metric = if shown.cpu { Metric::Cpu } else { Metric::CpuTemp };
+            Some((metric, load_and_temp_segment("CPU ", load, temp)))
+        }
+        Slot::Memory if shown.memory => {
+            Some((Metric::Memory, percent_segment("RAM ", snapshot.memory.as_ref().map(|m| m.percent()))))
+        }
+        Slot::Gpu if shown.gpu || shown.gpu_temp => {
+            let load = shown.gpu.then(|| gpu.and_then(|g| g.usage()));
+            let temp = shown.gpu_temp.then(|| gpu.and_then(|g| g.temperature()));
+            let metric = if shown.gpu { Metric::Gpu } else { Metric::GpuTemp };
+            Some((metric, load_and_temp_segment("GPU ", load, temp)))
+        }
+        Slot::Vram if shown.vram => {
+            Some((Metric::Vram, percent_segment("VRAM ", gpu.and_then(|g| g.main_adapter()?.vram_percent()))))
+        }
+        Slot::Network if shown.network => {
+            let network = snapshot.network.as_ref();
+            let job = segment_job(&[
                 ("NET ↓", LABEL_COLOR),
                 (&format::rate(network.map(|n| n.down_per_sec)), TEXT_COLOR),
                 (" ↑", LABEL_COLOR),
                 (&format::rate(network.map(|n| n.up_per_sec)), TEXT_COLOR),
-            ]),
-        ));
-    }
-    if shown.disk {
-        let disk = snapshot.disk.as_ref();
-        // Disk rates are colored by how busy the disks are, not by throughput.
-        let disk_level = percent_level(disk.and_then(|d| d.active_percent));
-        let disk_color = level_color(disk_level);
-        segments.push((
-            Metric::Disk,
-            segment_job(&[
+            ]);
+            Some((Metric::Network, job))
+        }
+        Slot::Disk if shown.disk => {
+            let disk = snapshot.disk.as_ref();
+            // Disk rates are colored by how busy the disks are, not by throughput.
+            let disk_level = percent_level(disk.and_then(|d| d.active_percent));
+            let disk_color = level_color(disk_level);
+            let job = segment_job(&[
                 ("DSK R", label_color(disk_level)),
                 (&format::rate(disk.and_then(|d| d.read_per_sec)), disk_color),
                 (" W", label_color(disk_level)),
                 (&format::rate(disk.and_then(|d| d.write_per_sec)), disk_color),
-            ]),
-        ));
-    }
-    if shown.system_drive {
-        let volume = snapshot.disk.as_ref().and_then(|d| d.system_volume());
-        let label = format!("{} ", volume.map_or("C:", |v| v.name()));
-        segments.push((Metric::SystemDrive, percent_segment(&label, volume.map(|v| v.used_percent()))));
-    }
-    if shown.top_process {
-        let top = snapshot.processes.as_ref().and_then(|p| p.first());
-        let name = fixed_width(top.map_or("--", |p| p.name.as_str()), TOP_NAME_WIDTH);
-        let cpu = top.map(|p| p.cpu);
-        segments.push((
-            Metric::TopProcess,
-            segment_job(&[
+            ]);
+            Some((Metric::Disk, job))
+        }
+        Slot::SystemDrive if shown.system_drive => {
+            let volume = snapshot.disk.as_ref().and_then(|d| d.system_volume());
+            let label = format!("{} ", volume.map_or("C:", |v| v.name()));
+            Some((Metric::SystemDrive, percent_segment(&label, volume.map(|v| v.used_percent()))))
+        }
+        Slot::TopProcess if shown.top_process => {
+            let top = snapshot.processes.as_ref().and_then(|p| p.first());
+            let name = fixed_width(top.map_or("--", |p| p.name.as_str()), TOP_NAME_WIDTH);
+            let cpu = top.map(|p| p.cpu);
+            let job = segment_job(&[
                 ("TOP ", LABEL_COLOR),
                 (&name, TEXT_COLOR),
                 (" ", LABEL_COLOR),
                 (&format::percent(cpu), percent_color(cpu)),
-            ]),
-        ));
+            ]);
+            Some((Metric::TopProcess, job))
+        }
+        _ => None,
     }
-    segments
 }
 
 fn peak(history: &History) -> f32 {
