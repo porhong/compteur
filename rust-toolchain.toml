@@ -1,0 +1,4 @@
+[toolchain]
+# gnullvm links with llvm-mingw (winget: MartinStorsjo.LLVM-MinGW.UCRT), so no Visual Studio / admin rights are needed.
+channel = "stable-x86_64-pc-windows-gnullvm"
+components = ["clippy", "rustfmt"]

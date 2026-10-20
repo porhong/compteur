@@ -1,0 +1,18 @@
+[package]
+name = "compteur"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+directories = "6.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = "0.39.6"
+toml = "1.1.8"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
