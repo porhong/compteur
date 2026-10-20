@@ -3,25 +3,42 @@
 
 mod app;
 mod config;
+mod controls;
 mod format;
+mod icon;
 mod metrics;
 mod pdh;
+mod platform;
 mod sampler;
+
+use std::sync::Arc;
 
 use eframe::egui;
 
+const WINDOW_ICON_SIZE: u32 = 64;
+
 fn main() -> eframe::Result {
+    if !platform::claim_single_instance() {
+        return Ok(()); // the running copy is reachable from the tray
+    }
     let config = config::Config::load();
 
+    let icon = egui::IconData {
+        rgba: icon::icon_rgba(WINDOW_ICON_SIZE),
+        width: WINDOW_ICON_SIZE,
+        height: WINDOW_ICON_SIZE,
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Compteur")
+        .with_icon(Arc::new(icon))
         .with_inner_size([360.0, app::STRIP_HEIGHT])
         .with_decorations(false)
         .with_transparent(true)
         .with_resizable(false)
         .with_window_level(egui::WindowLevel::AlwaysOnTop)
         .with_taskbar(false)
-        .with_active(false);
+        .with_active(false)
+        .with_mouse_passthrough(config.click_through);
     if let Some(position) = config.position {
         viewport = viewport.with_position(position);
     }

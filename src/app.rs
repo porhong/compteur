@@ -11,6 +11,8 @@ use eframe::egui::{
 
 use crate::{
     config::{Config, Metric, Shown},
+    controls::{Action, Controls},
+    platform::{self, Window},
     format::{self, Level},
     sampler::{self, HISTORY_LEN, History, Settings, Shared},
 };
@@ -32,6 +34,8 @@ const SAVE_DELAY: Duration = Duration::from_millis(800);
 /// Used to place the menu before its real size is known; it then resizes itself to fit.
 const MENU_SIZE: Vec2 = Vec2::new(230.0, 330.0);
 const REFRESH_CHOICES: [(u64, &str); 3] = [(500, "0.5 s"), (1000, "1 s"), (2000, "2 s")];
+/// How often the strip re-asserts its place at the top of the always-on-top band.
+const TOPMOST_INTERVAL: Duration = Duration::from_secs(5);
 /// Characters of the busiest app's name shown on the strip.
 const TOP_NAME_WIDTH: usize = 10;
 
@@ -42,6 +46,13 @@ pub struct App {
     dirty_since: Option<Instant>,
     shared: Arc<Mutex<Shared>>,
     menu: Option<MenuState>,
+    window: Option<Window>,
+    controls: Option<Controls>,
+    /// Mirrors the registry; the source of truth is the Run key, which the tray may also change.
+    autostart: bool,
+    /// Click-through state last sent to the window and the tray, to apply changes once.
+    applied: Option<(bool, bool)>,
+    raised_at: Instant,
 }
 
 struct MenuState {
@@ -54,7 +65,73 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let shared = sampler::spawn(cc.egui_ctx.clone(), Settings::from_config(&config));
-        Self { saved: config.clone(), config, dirty_since: None, shared, menu: None }
+
+        let window = Window::from_handle(cc);
+        let autostart = platform::autostart_enabled();
+        if autostart {
+            // Re-register so the entry follows the exe if it was moved.
+            if let Err(err) = platform::set_autostart(true) {
+                eprintln!("compteur: failed to refresh autostart: {err}");
+            }
+        }
+        let controls =
+            window.and_then(|window| Controls::new(cc.egui_ctx.clone(), window, config.click_through, autostart));
+
+        Self {
+            saved: config.clone(),
+            config,
+            dirty_since: None,
+            shared,
+            menu: None,
+            window,
+            controls,
+            autostart,
+            applied: None,
+            raised_at: Instant::now(),
+        }
+    }
+
+    /// Opens the settings menu `x` points from the strip's left edge.
+    fn open_menu(&mut self, ctx: &egui::Context, x: f32) {
+        let strip_origin = ctx.input(|i| i.viewport().outer_rect).map_or(Pos2::ZERO, |r| r.min);
+        let monitor_height = ctx.input(|i| i.viewport().monitor_size).map(|s| s.y);
+        let y = popup_y(strip_origin.y, MENU_SIZE.y, monitor_height);
+        self.menu = Some(MenuState { position: Pos2::new(strip_origin.x + x, y), was_focused: false });
+    }
+
+    /// Applies tray-menu and hotkey actions. Showing/hiding and autostart were already done by the
+    /// event handler itself, since a hidden window gets no frames.
+    fn handle_actions(&mut self, ctx: &egui::Context) {
+        let actions = self.controls.as_ref().map(Controls::take_actions).unwrap_or_default();
+        for action in actions {
+            match action {
+                Action::ToggleVisible => {}
+                Action::ToggleClickThrough => self.config.click_through = !self.config.click_through,
+                Action::OpenSettings => self.open_menu(ctx, 0.0),
+                Action::ToggleAutostart => self.autostart = platform::autostart_enabled(),
+                Action::Exit => {
+                    self.save_now();
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+
+        let state = (self.config.click_through, self.autostart);
+        if self.applied != Some(state) {
+            ctx.send_viewport_cmd(ViewportCommand::MousePassthrough(self.config.click_through));
+            if let Some(controls) = &self.controls {
+                controls.sync(self.config.click_through, self.autostart);
+            }
+            self.applied = Some(state);
+        }
+
+        if let Some(window) = self.window {
+            window.keep_out_of_alt_tab();
+            if self.raised_at.elapsed() >= TOPMOST_INTERVAL {
+                window.raise_topmost();
+                self.raised_at = Instant::now();
+            }
+        }
     }
 
     fn save_now(&mut self) {
@@ -98,6 +175,7 @@ impl App {
         let mut exit = false;
 
         let config = &mut self.config;
+        let mut autostart = self.autostart;
         let builder = popup_builder("Compteur menu", menu.position, MENU_SIZE);
         ctx.show_viewport_immediate(ViewportId::from_hash_of("menu"), builder, |ui, _class| {
             let focused = ui.ctx().input(|i| i.viewport().focused);
@@ -108,7 +186,7 @@ impl App {
                 close = true;
             }
             let panel = egui::CentralPanel::default().show(ui, |ui| {
-                exit = menu_contents(ui, config);
+                exit = menu_contents(ui, config, &mut autostart);
                 ui.min_rect().size()
             });
             // Fit the window to its contents plus the panel's 8 pt margin on each side.
@@ -119,6 +197,12 @@ impl App {
             }
         });
 
+        if autostart != self.autostart {
+            if let Err(err) = platform::set_autostart(autostart) {
+                eprintln!("compteur: failed to change autostart: {err}");
+            }
+            self.autostart = platform::autostart_enabled();
+        }
         if exit {
             self.save_now();
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -136,6 +220,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.handle_actions(&ctx);
         self.persist(&ctx);
 
         let mut shared = sampler::lock(&self.shared);
@@ -176,20 +261,20 @@ impl eframe::App for App {
         }
         let strip_origin = ctx.input(|i| i.viewport().outer_rect).map_or(Pos2::ZERO, |r| r.min);
         let monitor_height = ctx.input(|i| i.viewport().monitor_size).map(|s| s.y);
-        if response.secondary_clicked() {
-            let click_x = response.interact_pointer_pos().map_or(0.0, |p| p.x);
-            let y = popup_y(strip_origin.y, MENU_SIZE.y, monitor_height);
-            self.menu = Some(MenuState { position: Pos2::new(strip_origin.x + click_x, y), was_focused: false });
-        }
+        let menu_click = response.secondary_clicked().then(|| response.interact_pointer_pos().map_or(0.0, |p| p.x));
 
         // Details for the hovered segment, unless the menu or a drag is in progress.
         let hovered = response
             .hover_pos()
-            .filter(|_| self.menu.is_none() && !response.dragged())
+            .filter(|_| self.menu.is_none() && menu_click.is_none() && !response.dragged())
             .and_then(|pos| spans.iter().find(|(_, span)| span.contains(&pos.x)))
             .map(|(metric, span)| (*metric, span.start));
         let details = hovered.map(|(metric, x)| (x, detail_lines(metric, &shared, self.config.refresh_ms)));
         drop(shared);
+
+        if let Some(x) = menu_click {
+            self.open_menu(&ctx, x);
+        }
 
         if let Some((x, lines)) = details {
             let galleys: Vec<_> = lines
@@ -203,7 +288,7 @@ impl eframe::App for App {
 }
 
 /// Settings menu. Changes apply immediately; returns true when Exit was clicked.
-fn menu_contents(ui: &mut egui::Ui, config: &mut Config) -> bool {
+fn menu_contents(ui: &mut egui::Ui, config: &mut Config, autostart: &mut bool) -> bool {
     ui.label(egui::RichText::new("Show on strip").strong());
     let shown_count = config.shown.count();
     for metric in Metric::ALL {
@@ -227,6 +312,9 @@ fn menu_contents(ui: &mut egui::Ui, config: &mut Config) -> bool {
         ui.add(egui::Slider::new(&mut config.opacity, 0.2..=1.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
     });
     ui.checkbox(&mut config.locked, "Lock position");
+    ui.checkbox(&mut config.click_through, "Click-through (Ctrl+Alt+M)")
+        .on_hover_text("Clicks go to the window below. Use the tray icon or the hotkey to turn it off.");
+    ui.checkbox(autostart, "Start with Windows");
 
     ui.separator();
     ui.button("Exit Compteur").clicked()

@@ -118,12 +118,21 @@ pub struct Config {
     pub refresh_ms: u64,
     /// When set, the strip can't be dragged.
     pub locked: bool,
+    /// When set, clicks pass through the strip to the window below.
+    pub click_through: bool,
     pub shown: Shown,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { position: None, opacity: 0.85, refresh_ms: 1000, locked: false, shown: Shown::default() }
+        Self {
+            position: None,
+            opacity: 0.85,
+            refresh_ms: 1000,
+            locked: false,
+            click_through: false,
+            shown: Shown::default(),
+        }
     }
 }
 

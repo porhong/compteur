@@ -6,10 +6,13 @@ edition = "2024"
 [dependencies]
 directories = "6.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+global-hotkey = "0.9.0"
+raw-window-handle = "0.6"
 serde = { version = "1.0.229", features = ["derive"] }
 sysinfo = "0.39.6"
 toml = "1.1.8"
-windows = { version = "0.62", features = ["Win32_System_Performance", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Wdk_Graphics_Direct3D"] }
+tray-icon = "0.26.1"
+windows = { version = "0.62", features = ["Win32_System_Performance", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Wdk_Graphics_Direct3D", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_System_Registry", "Win32_Security"] }
 
 [profile.release]
 opt-level = 3
@@ -17,3 +20,6 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[build-dependencies]
+embed-resource = "3.0.12"
