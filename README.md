@@ -85,7 +85,11 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow checks that the tag matches `Cargo.toml`, runs the tests and clippy, builds on GitHub's Windows runner (MSVC toolchain, static C runtime) and attaches `compteur.exe` plus its SHA-256 to the release.
+The release workflow checks that the tag matches `Cargo.toml`, runs the tests and clippy, builds on GitHub's Windows runner (MSVC toolchain, static C runtime) and attaches `compteur.exe`, the Microsoft Store package `compteur-<version>.0-x64.msix` and their SHA-256 sums to the release.
+
+### Microsoft Store
+
+`packaging/AppxManifest.xml` holds the package identity from Partner Center (product `9MXR4DNWCQGQ`); `packaging/Assets` comes from `tools/make_icon.py`. Upload the release's `.msix` under the submission's Packages; the Store signs it. Inside the package, "Start with Windows" uses the manifest's startup task instead of the Run key. Privacy policy: [PRIVACY.md](PRIVACY.md).
 
 ## Code map
 

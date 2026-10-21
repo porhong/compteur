@@ -4,9 +4,10 @@ use std::{collections::HashSet, io};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::{
+    ApplicationModel::{StartupTask, StartupTaskState},
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
+            APPMODEL_ERROR_NO_PACKAGE, CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT,
             WPARAM,
         },
         Graphics::Dwm::{
@@ -14,6 +15,7 @@ use windows::{
             DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+        Storage::Packaging::Appx::GetCurrentPackageFullName,
         System::{
             Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW},
             ProcessStatus::K32EmptyWorkingSet,
@@ -176,15 +178,41 @@ pub fn claim_single_instance() -> bool {
 
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 const RUN_VALUE: PCWSTR = w!("Compteur");
+/// The startup task declared in `packaging/AppxManifest.xml`.
+const STARTUP_TASK_ID: &str = "CompteurStartup";
+
+/// True when running from the Store (MSIX) package. There, writes to the Run key go to the
+/// package's private registry and are ignored at sign-in, so the manifest's startup task is used.
+fn is_packaged() -> bool {
+    let mut length = 0;
+    // SAFETY: a length query with no buffer.
+    let status = unsafe { GetCurrentPackageFullName(&mut length, None) };
+    status != APPMODEL_ERROR_NO_PACKAGE
+}
+
+fn startup_task() -> windows::core::Result<StartupTask> {
+    StartupTask::GetAsync(&HSTRING::from(STARTUP_TASK_ID))?.join()
+}
 
 /// Whether the app is registered to start at sign-in (per user, so no admin rights needed).
 pub fn autostart_enabled() -> bool {
+    if is_packaged() {
+        let state = startup_task().and_then(|task| task.State());
+        return state.is_ok_and(|s| s == StartupTaskState::Enabled || s == StartupTaskState::EnabledByPolicy);
+    }
     // SAFETY: an existence check; no output buffers are passed.
     let status = unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, None, None) };
     status == ERROR_SUCCESS
 }
 
 pub fn set_autostart(enabled: bool) -> io::Result<()> {
+    if is_packaged() {
+        let task = startup_task().map_err(io::Error::other)?;
+        // Once the user turns the task off in Task Manager, only they can turn it back on; the
+        // request then just reports that state, which `autostart_enabled` shows.
+        let result = if enabled { task.RequestEnableAsync().and_then(|op| op.join()).map(drop) } else { task.Disable() };
+        return result.map_err(io::Error::other);
+    }
     let status = if enabled {
         let exe = std::env::current_exe()?;
         let command = HSTRING::from(format!("\"{}\"", exe.display()));

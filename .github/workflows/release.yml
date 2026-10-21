@@ -1,4 +1,4 @@
-# Pushing a tag like v0.1.0 tests, builds and publishes compteur.exe as a GitHub release.
+# Pushing a tag like v0.2.0 tests, builds and publishes compteur.exe and the Store MSIX as a GitHub release.
 name: Release
 
 on:
@@ -51,13 +51,27 @@ jobs:
       - name: Build
         run: cargo build --locked --release
 
+      # Unsigned on purpose: the Store signs MSIX packages when they are submitted in Partner Center.
+      - name: Package MSIX for the Microsoft Store
+        shell: pwsh
+        run: |
+          $version = "$($env:GITHUB_REF_NAME.TrimStart('v')).0" # the Store requires the 4th part to be 0
+          $makeappx = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          New-Item -ItemType Directory -Force package, dist | Out-Null
+          Copy-Item target\release\compteur.exe package\
+          Copy-Item -Recurse packaging\Assets package\Assets
+          (Get-Content packaging\AppxManifest.xml -Raw).Replace('{{VERSION}}', $version) |
+            Set-Content package\AppxManifest.xml -Encoding utf8
+          & $makeappx.FullName pack /d package /p "dist\compteur-$version-x64.msix" /o
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Publish release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir dist
           cp target/release/compteur.exe dist/compteur.exe
-          (cd dist && sha256sum compteur.exe > compteur.exe.sha256)
-          gh release create "$GITHUB_REF_NAME" dist/compteur.exe dist/compteur.exe.sha256 \
+          (cd dist && sha256sum compteur.exe *.msix > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/compteur.exe dist/*.msix dist/SHA256SUMS \
             --title "Compteur $GITHUB_REF_NAME" --generate-notes

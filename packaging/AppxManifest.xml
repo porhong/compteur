@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest for the Microsoft Store. The release workflow fills in {{VERSION}} from Cargo.toml.
+  Identity values come from Partner Center > Product identity and must match it exactly.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop rescap">
+
+  <Identity
+    Name="Anantbot.MyCompteur"
+    Publisher="CN=F5139EC7-1C4B-459C-8AF2-991C68A0C9D3"
+    Version="{{VERSION}}"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>My Compteur</DisplayName>
+    <PublisherDisplayName>Anantbot</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Compteur" Executable="compteur.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="My Compteur"
+        Description="Always-on-top strip showing CPU, RAM, GPU, disk and network use."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- "Start with Windows" in a package; the app turns it on and off (platform::set_autostart). -->
+        <desktop:Extension Category="windows.startupTask" Executable="compteur.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="CompteurStartup" Enabled="false" DisplayName="My Compteur" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- A desktop (Win32) app: needed to read performance counters, show the tray icon, etc. -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>
